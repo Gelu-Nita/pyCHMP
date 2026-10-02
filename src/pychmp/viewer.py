@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -15,7 +16,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 import numpy as np
 from astropy.io import fits
 from matplotlib.collections import PatchCollection
@@ -42,6 +43,7 @@ from .ab_scan_artifacts import (
     default_point_index,
     extend_patch_grid_model_with_pending_point,
     find_record_for_point,
+    _axis_spans,
     grid_indices_for_coordinates,
     grid_patch_rectangle,
     nearest_index,
@@ -55,7 +57,15 @@ from .ab_scan_artifacts import (
     with_observer_metadata,
 )
 from .grid_points import load_grid_point_live_state
-from .metrics import format_metrics_mask_label, resolve_metrics_threshold_mask, resolve_threshold_mask
+from .slice_map_index import slice_index_ab_snapshot
+from .metrics import (
+    METRICS_MASK_STAGE_UNKNOWN,
+    format_metrics_mask_label,
+    resolve_metrics_mask_inconsistency_warning,
+    resolve_metrics_mask_type,
+    resolve_metrics_threshold_mask,
+    resolve_threshold_mask,
+)
 from .viewer_plot_style import (
     apply_heatmap_axis_style,
     apply_figure_autolayout,
@@ -155,6 +165,17 @@ def _save_heatmap_log_scale_pref(enabled: bool) -> None:
     _write_viewer_state(payload)
 
 
+def _load_unvisited_store_dots_pref() -> bool:
+    value = _read_viewer_state().get("unvisited_store_dots")
+    return bool(value) if isinstance(value, bool) else False
+
+
+def _save_unvisited_store_dots_pref(enabled: bool) -> None:
+    payload = _read_viewer_state()
+    payload["unvisited_store_dots"] = bool(enabled)
+    _write_viewer_state(payload)
+
+
 def _format_scalar(value: Any, pattern: str) -> str:
     try:
         numeric = float(value)
@@ -186,6 +207,17 @@ def _first_finite_float(*values: Any) -> float | None:
         if numeric is not None:
             return numeric
     return None
+
+
+def _valid_display_map_array(value: object) -> bool:
+    """True when value is a finite 2-D map suitable for matplotlib image panels."""
+    try:
+        arr = np.asarray(value, dtype=float)
+    except Exception:
+        return False
+    if arr.ndim != 2 or arr.size <= 0:
+        return False
+    return bool(np.any(np.isfinite(arr)))
 
 
 def _sequence_as_list(value: Any) -> list[Any]:
@@ -351,7 +383,7 @@ class _SelectedSolutionWindow:
         self.toolbar_context_var = tk.StringVar(value="Selected solution window is ready.")
         self.common_map_link_var = tk.StringVar(value="Auto (each panel)")
         self.common_map_scale_var = tk.StringVar(value="linear")
-        self.residual_map_mode_var = tk.StringVar(value="Tb (M−O)")
+        self.residual_map_mode_var = tk.StringVar(value="Tb (O−M)")
         self.residual_map_scale_var = tk.StringVar(value="linear")
 
         outer = ttk.Frame(self.window, padding=8)
@@ -416,7 +448,7 @@ class _SelectedSolutionWindow:
             toolbar,
             width=22,
             state="readonly",
-            values=("Tb (M−O)", "Normalized (M−O)/(M+O)"),
+            values=("Tb (O−M)", "Normalized (O−M)/(O+M)"),
             textvariable=self.residual_map_mode_var,
         )
         place(residual_mode_menu)
@@ -453,7 +485,7 @@ class _SelectedSolutionWindow:
         _ToolTip(maps_auto_button, "Reset map link and scale to defaults (per-panel auto limits).")
         _ToolTip(
             residual_mode_menu,
-            "Residual definition: Tb difference (model−obs) or normalized (M−O)/(M+O) in [-1, 1].",
+            "Residual definition: Tb difference (observed−model) or normalized (observed−model)/(observed+model) in [-1, 1].",
         )
         _ToolTip(residual_scale_menu, "Residual intensity scale. Use symlog for signed residuals with wide dynamic range.")
         _ToolTip(residual_auto_button, "Reset residual type and scale to defaults.")
@@ -602,7 +634,7 @@ class _SelectedSolutionWindow:
     def update_selection(self) -> None:
         context = self.app._selected_solution_plot_context()
         if context is None:
-            self.toolbar_context_var.set("No completed point available yet.")
+            self.toolbar_context_var.set(self.app._selected_solution_maps_status_message())
             return
         self.current_context = context
         diagnostics = dict(context["diagnostics"])
@@ -666,7 +698,7 @@ class _SelectedSolutionWindow:
         self.update_selection()
 
     def _reset_residual_map_display(self) -> None:
-        self.residual_map_mode_var.set("Tb (M−O)")
+        self.residual_map_mode_var.set("Tb (O−M)")
         self.residual_map_scale_var.set("linear")
         self.update_selection()
 
@@ -945,6 +977,16 @@ class PychmpViewApp:
     _LOAD_RETRY_DELAY_S = 0.35
     _EXTERNAL_REFRESH_POLL_MS = 600
     _MIN_HEARTBEAT_RELOAD_INTERVAL_S = 2.0
+    _LIVE_STATE_SYNC_MIN_INTERVAL_S = 1.0
+    _SLICE_GRID_RELOAD_EVENTS = frozenset(
+        {
+            "search_initialized",
+            "point_assigned",
+            "point_completed",
+            "point_failed",
+            "search_completed",
+        }
+    )
     _MAX_LOG_LINES = 3000
     _INITIAL_LOG_READ_BYTES = 262_144
     _HEATMAP_FOOTER_HEIGHT = 108
@@ -1006,6 +1048,7 @@ class PychmpViewApp:
         self.trial_label_var = tk.StringVar(value="trial: n/a")
         self.shared_heatmap_axes_var = tk.BooleanVar(value=_load_shared_grid_axes_pref())
         self.heatmap_log_scale_var = tk.BooleanVar(value=_load_heatmap_log_scale_pref())
+        self.unvisited_store_dots_var = tk.BooleanVar(value=_load_unvisited_store_dots_pref())
         self._shared_heatmap_extents: dict[str, float] | None = None
         self._open_global_best_applied = False
         self.a_index_var = tk.IntVar(value=0)
@@ -1043,16 +1086,30 @@ class PychmpViewApp:
         self._initial_reload_after_id: str | None = None
         self._initial_reload_in_progress = False
         self._initial_reload_token = 0
+        self._payload_reload_in_progress = False
+        self._payload_reload_token = 0
+        self._deferred_scan_load_request: dict[str, Any] | None = None
+        self._pending_refresh_signal_payload: dict[str, Any] | None = None
+        self._pending_refresh_event_payload: dict[str, Any] | None = None
+        self._refresh_all_after_id: str | None = None
+        self._pending_refresh_all_update_solution = False
+        self._pending_refresh_scope = "full"
+        self._last_live_state_sync_at_s = 0.0
+        self._last_live_state_sync_point_id: str | None = None
         self._present_window_after_id: str | None = None
         self._selected_solution_update_after_id: str | None = None
         self._psf_metadata_cache: dict[str, PSFMetadata | None] = {}
         self._psf_kernel_cache: dict[tuple[Any, ...], np.ndarray] = {}
+        self._slice_psf_kernel_by_key: dict[str, np.ndarray | None] = {}
         self._live_trial_render_cache_key: tuple[Any, ...] | None = None
         self._live_trial_render_cache_value: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._live_snapshot_cache_key: tuple[Any, ...] | None = None
         self._live_snapshot_cache_value: dict[str, Any] | None = None
         self._selected_trial_map_cache_key: tuple[Any, ...] | None = None
         self._selected_trial_map_cache_value: dict[str, Any] | None = None
+        self._heatmap_selection_artists: list[Any] = []
+        self._unvisited_store_dot_cache: dict[str, Any] = {}
+        self._unvisited_store_dot_load_key: str | None = None
         self.refresh_button: ttk.Button | None = None
         self.metric_menu: ttk.Combobox | None = None
         self.navigation_mode_var = tk.StringVar(value="free")
@@ -1453,6 +1510,9 @@ class PychmpViewApp:
                 if self._is_closing or int(self._initial_reload_token) != token:
                     return
                 self._initial_reload_in_progress = False
+                if (requested_slice_key, requested_search_id) != (self._selected_slice_key(), self._selected_search_id()):
+                    self._schedule_payload_reload()
+                    return
                 if error is not None:
                     if isinstance(error, FileNotFoundError):
                         self.status_var.set(
@@ -1535,6 +1595,7 @@ class PychmpViewApp:
             self._present_window_after_id,
             self._selected_solution_update_after_id,
             self._plot_canvas_resize_after_id,
+            self._refresh_all_after_id,
         ):
             if after_id is None:
                 continue
@@ -1548,6 +1609,7 @@ class PychmpViewApp:
         self._initial_reload_in_progress = False
         self._present_window_after_id = None
         self._selected_solution_update_after_id = None
+        self._refresh_all_after_id = None
         if self.selected_solution_window is not None:
             try:
                 self.selected_solution_window.window.destroy()
@@ -1734,6 +1796,10 @@ class PychmpViewApp:
     def _metric_selection_locked(self) -> bool:
         return self._navigation_mode() == "active"
 
+    def _metrics_pointer_locked(self) -> bool:
+        """Active and Best keep the red q0 pointer on the best trial. Free is the only movable mode."""
+        return self._navigation_mode() in {"active", "best"}
+
     def _navigation_is_locked(self) -> bool:
         return self._grid_point_selection_locked()
 
@@ -1802,31 +1868,72 @@ class PychmpViewApp:
             return False
         if text in {"scan complete", "complete"}:
             return True
-        return text in {
+        return self._refresh_phase_indicates_failure(text)
+
+    def _refresh_phase_indicates_failure(self, phase: str | None = None) -> bool:
+        text = str(phase if phase is not None else getattr(self, "_refresh_signal_phase", "") or "").strip().lower()
+        if not text:
+            return False
+        if text in {
             "scan interrupted",
             "interrupted",
             "scan aborted",
             "aborted",
             "scan failed",
             "failed",
-        }
+        }:
+            return True
+        return any(token in text for token in ("failed", "interrupted", "aborted"))
 
     def _refresh_event_is_terminal(self, event: str | None = None) -> bool:
         name = str(event if event is not None else getattr(self, "_refresh_signal_event", "") or "").strip().lower()
         return name in {"search_completed", "search_failed"}
 
+    def _selected_search_lifecycle_dict(self) -> dict[str, Any]:
+        payload = getattr(self, "payload", None) or {}
+        selected = dict(payload.get("selected_search") or {})
+        lifecycle = dict(selected.get("lifecycle") or {})
+        status = str(selected.get("status", lifecycle.get("status", "")) or "").strip()
+        if status:
+            lifecycle["status"] = status
+        if "in_progress" in selected:
+            lifecycle["in_progress"] = bool(selected.get("in_progress"))
+        if "active" in selected:
+            lifecycle["active"] = bool(selected.get("active"))
+        return lifecycle
+
+    def _selected_search_is_successfully_complete(self) -> bool:
+        """True only for the selected search's own successful completion.
+
+        Does not inherit a stale ``completed_at`` from a prior run, and does not
+        treat an inactive marker alone as success.
+        """
+        from .ab_scan_artifacts import search_lifecycle_completed_at_is_authoritative
+
+        lifecycle = self._selected_search_lifecycle_dict()
+        status = str(lifecycle.get("status", "") or "").strip().lower()
+        if status in {"complete", "completed"}:
+            return True
+        if status in {"in_progress", "running", "indexing", "pending", "failed", "aborted", "interrupted"}:
+            return False
+        return search_lifecycle_completed_at_is_authoritative(lifecycle)
+
+    def _selected_search_is_failed_or_interrupted(self) -> bool:
+        lifecycle = self._selected_search_lifecycle_dict()
+        status = str(lifecycle.get("status", "") or "").strip().lower()
+        return status in {"failed", "aborted", "interrupted"}
+
     def _search_run_terminal(self) -> bool:
         if self._refresh_event_is_terminal() or self._refresh_phase_is_terminal():
             return True
-        payload = getattr(self, "payload", None) or {}
-        if payload:
-            selected = dict(payload.get("selected_search") or {})
-            lifecycle = dict(selected.get("lifecycle") or {})
-            status = str(selected.get("status", "") or "").strip().lower()
-            if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
-                return True
-            if str(lifecycle.get("completed_at") or "").strip():
-                return True
+        lifecycle = self._selected_search_lifecycle_dict()
+        status = str(lifecycle.get("status", "") or "").strip().lower()
+        if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
+            return True
+        from .ab_scan_artifacts import search_lifecycle_completed_at_is_authoritative
+
+        if search_lifecycle_completed_at_is_authoritative(lifecycle):
+            return True
         pid = self._runner_pid_from_log()
         if pid is not None and self._process_is_running(pid):
             return False
@@ -1856,7 +1963,12 @@ class PychmpViewApp:
         if not log_path.exists():
             return None
         try:
-            text = log_path.read_text(encoding="utf-8", errors="replace")
+            with log_path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = int(handle.tell())
+                read_size = min(size, int(self._INITIAL_LOG_READ_BYTES))
+                handle.seek(max(0, size - read_size), os.SEEK_SET)
+                text = handle.read(read_size).decode("utf-8", errors="replace")
         except Exception:
             return None
         matches = re.findall(r"pid=(\d+)", text)
@@ -1868,10 +1980,23 @@ class PychmpViewApp:
             return None
 
     def _process_is_running(self, pid: int) -> bool:
+        """Return True when ``pid`` refers to an existing process.
+
+        ``os.kill(pid, 0)`` raises ``PermissionError`` / ``EPERM`` when the
+        process exists but this user cannot signal it; treat that as alive so
+        operators do not get a false Incomplete while another user's runner
+        still owns the artifact.
+        """
         try:
             os.kill(int(pid), 0)
             return True
-        except OSError:
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.EPERM:
+                return True
             return False
 
     def _artifact_marks_active_search(self) -> bool:
@@ -1883,13 +2008,27 @@ class PychmpViewApp:
         lifecycle = dict(selected.get("lifecycle") or {})
         return bool(selected.get("active", lifecycle.get("active", False)))
 
-    def _live_runner_detected(self) -> bool:
+    def _runner_pid_alive_state(self) -> str:
+        """Return ``alive``, ``dead``, or ``unknown`` for the artifact log PID."""
         pid = self._runner_pid_from_log()
-        if pid is not None and self._process_is_running(pid):
+        if pid is None:
+            return "unknown"
+        return "alive" if self._process_is_running(pid) else "dead"
+
+    def _live_runner_detected(self) -> bool:
+        """True while the search process is alive, or heartbeat-only if PID unknown.
+
+        A known-dead PID never counts as live, even if a stale refresh file remains.
+        Incomplete/Interrupted badges apply only after the process is gone.
+        """
+        state = self._runner_pid_alive_state()
+        if state == "alive":
             return True
+        if state == "dead":
+            return False
         if self._refresh_signal_is_fresh() and not self._search_run_terminal():
             return True
-        return not self._search_run_terminal()
+        return False
 
     def _bind_refresh_signal_path(self) -> None:
         artifact_h5 = getattr(self, "artifact_h5", None)
@@ -2490,22 +2629,45 @@ class PychmpViewApp:
         if self.artifact_h5 is None:
             return
         event = str(refresh_payload.get("event", "") or "").strip().lower()
-        if event == "search_initialized" and self._live_runner_detected():
+        if (
+            event == "search_initialized"
+            and self._live_runner_detected()
+            and not getattr(self, "_navigation_mode_user_chosen", False)
+        ):
             self.navigation_mode_var.set("active")
             self._navigation_mode_initialized = True
         if not getattr(self, "payload", None):
-            self._reload_payload()
+            self._schedule_payload_reload()
             return
         mode = self._navigation_mode()
-        if mode == "active" or event == "search_initialized":
+        if mode == "active":
             slice_key = str(refresh_payload.get("slice_key", "") or "").strip()
             search_id = str(refresh_payload.get("search_id", "") or "").strip()
             if slice_key:
                 self.slice_key_var.set(slice_key)
             if search_id and self._search_id_in_artifact(search_id, slice_key=slice_key or None):
                 self.search_id_var.set(search_id)
-        if not self._refresh_slice_grid_metadata():
+        if event == "trial_committed":
+            self._finish_lightweight_refresh_event(refresh_payload)
             return
+        if event not in self._SLICE_GRID_RELOAD_EVENTS:
+            return
+        self._schedule_slice_grid_metadata_refresh(refresh_payload)
+
+    def _finish_lightweight_refresh_event(self, refresh_payload: dict[str, Any]) -> None:
+        mode = self._navigation_mode()
+        self._apply_navigation_from_refresh(refresh_payload)
+        self._sync_live_trial_state_from_artifact(force=True)
+        if mode in {"active", "best"}:
+            self._apply_locked_navigation_selection(schedule_slice_reload=False)
+        self._refresh_selector_values()
+        self._refresh_scan_state_display()
+        self._refresh_action_states()
+        if self.payload:
+            self._schedule_refresh_all(update_selected_solution=True)
+
+    def _finish_refresh_event_ui(self, refresh_payload: dict[str, Any]) -> None:
+        mode = self._navigation_mode()
         self._apply_navigation_from_refresh(refresh_payload)
         self._sync_live_trial_state_from_artifact()
         if mode in {"active", "best"}:
@@ -2514,7 +2676,60 @@ class PychmpViewApp:
         self._refresh_scan_state_display()
         self._refresh_action_states()
         if self.payload:
-            self._refresh_all(update_selected_solution=True)
+            self._schedule_refresh_all(update_selected_solution=True)
+
+    def _schedule_slice_grid_metadata_refresh(self, refresh_payload: dict[str, Any]) -> None:
+        if self.artifact_h5 is None:
+            return
+        self._pending_refresh_event_payload = dict(refresh_payload)
+        requested_slice_key = self._selected_slice_key()
+        requested_search_id = self._selected_search_id()
+
+        def _apply_payload(payload: dict[str, Any]) -> None:
+            pending = dict(self._pending_refresh_event_payload or refresh_payload)
+            self._pending_refresh_event_payload = None
+            self._apply_slice_grid_metadata_from_payload(
+                payload,
+                requested_slice_key=requested_slice_key,
+                requested_search_id=requested_search_id,
+            )
+            self._finish_refresh_event_ui(pending)
+            self._drain_pending_refresh_signal()
+
+        self._schedule_background_scan_load(
+            slice_key=requested_slice_key,
+            search_id=requested_search_id,
+            on_success=_apply_payload,
+            invalidate_selection_cache=True,
+        )
+
+    def _apply_slice_grid_metadata_from_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        requested_slice_key: str | None,
+        requested_search_id: str | None,
+    ) -> None:
+        self._capture_free_grid_selection_coords()
+        cache_key = (str(requested_slice_key or ""), str(requested_search_id or ""))
+        selected_cache_key = (
+            str(payload.get("selected_slice_key", "") or ""),
+            str(payload.get("selected_search_id", "") or ""),
+        )
+        self.payload = payload
+        self._payload_cache_by_selection[cache_key] = payload
+        self._payload_cache_by_selection[selected_cache_key] = payload
+        self.available_slices = list(self.payload.get("available_slices", []))
+        self.available_searches = list(self.payload.get("search_records", []))
+        self.a_values = np.asarray(self.payload["a_values"], dtype=float)
+        self.b_values = np.asarray(self.payload["b_values"], dtype=float)
+        self.display_model = build_patch_grid_model(self.payload)
+        self.run_target_metric = str(self.payload.get("target_metric", "chi2"))
+        self._refresh_shared_heatmap_extents()
+        self._last_payload_reload_at_s = float(time.time())
+        if self._navigation_mode() == "free":
+            self._restore_free_grid_selection_from_coords()
+        self._pin_slice_psf_kernel()
 
     def _point_is_saved(self, a_index: int, b_index: int) -> bool:
         points = dict((getattr(self, "payload", {}) or {}).get("points", {}))
@@ -2637,6 +2852,7 @@ class PychmpViewApp:
             self._apply_best_navigation(force_reanchor=True)
         self._navigation_mode_user_chosen = True
         if requested == "free":
+            self._open_session_prefers_active = False
             self._anchor_free_selection_to_current_indices()
             self._stale_active_notice = ""
         self._refresh_navigation_control_states()
@@ -2728,13 +2944,40 @@ class PychmpViewApp:
             )
             artifact_live = self._heartbeat_activity_present() and matches_slice and matches_search
             runner_active = self._runner_targets_selection(selected_slice_key=selected_slice_key)
+            pid_dead = self._runner_pid_alive_state() == "dead"
+            heartbeat_running = (not pid_dead) and (
+                artifact_live or (adaptive_point_run and refresh_active and matches_slice)
+            )
 
-            if runner_active or artifact_live or (adaptive_point_run and refresh_active and matches_slice):
-                badge = "RUNNING"
-                color = "#0b7285"
-            elif artifact_live or search_active_flag:
+            phase = str(self._refresh_signal_phase or "").strip().lower()
+            phase_aborted = self._refresh_phase_indicates_failure(phase)
+            search_completed = self._selected_search_is_successfully_complete()
+            search_failed = self._selected_search_is_failed_or_interrupted()
+
+            # Align with non-empty PID-dead rules: leftover active/heartbeat
+            # markers after the runner is gone are Incomplete, not Interrupted,
+            # unless phase/status indicates failure. Authoritative complete
+            # still wins over a stale live PID (see Oct 2 badge note).
+            if runner_active or heartbeat_running:
+                if self._search_run_terminal():
+                    if search_failed or phase_aborted:
+                        badge = "INTERRUPTED"
+                        color = "#c92a2a"
+                    else:
+                        badge = "FINISHED"
+                        color = "#2b8a3e"
+                else:
+                    badge = "RUNNING"
+                    color = "#0b7285"
+            elif phase_aborted or search_failed:
                 badge = "INTERRUPTED"
                 color = "#c92a2a"
+            elif search_completed:
+                badge = "FINISHED"
+                color = "#2b8a3e"
+            elif artifact_live or search_active_flag or bool(started_at):
+                badge = "INCOMPLETE"
+                color = "#b26a00"
             else:
                 badge = "EMPTY"
                 color = "#6c757d"
@@ -2770,14 +3013,7 @@ class PychmpViewApp:
 
         phase = str(self._refresh_signal_phase or "").strip().lower()
         phase_complete = phase in {"scan complete", "complete"}
-        phase_aborted = phase in {
-            "scan interrupted",
-            "interrupted",
-            "scan aborted",
-            "aborted",
-            "scan failed",
-            "failed",
-        }
+        phase_aborted = self._refresh_phase_indicates_failure(phase)
         heartbeat_slice_key = str(getattr(self, "_refresh_signal_slice_key", None) or "").strip()
         heartbeat_search_id = str(getattr(self, "_refresh_signal_search_id", None) or "").strip()
         matches_slice, matches_search = self._heartbeat_matches_selection(
@@ -2787,30 +3023,38 @@ class PychmpViewApp:
         scoped_refresh_active = refresh_active and matches_slice
         scoped_phase_complete = phase_complete and matches_slice
         artifact_live_active = self._heartbeat_activity_present() and matches_slice and matches_search
-        search_completed = (search_status == "complete") or bool(completed_at)
+        search_completed = self._selected_search_is_successfully_complete()
+        search_failed = self._selected_search_is_failed_or_interrupted()
         runner_active = self._runner_targets_selection(
             selected_slice_key=selected_slice_key,
             selected_search_id=selected_search_id,
         )
         live_runner = runner_active and (artifact_live_active or self._heartbeat_activity_present())
         cross_slice_runner = self._live_runner_detected() and not matches_slice
-
-        if (
-            runner_active
-            or artifact_live_active
-            or cross_slice_runner
+        pid_dead = self._runner_pid_alive_state() == "dead"
+        heartbeat_running = (not pid_dead) and (
+            artifact_live_active
             or (adaptive_point_run and scoped_refresh_active and not scoped_phase_complete)
-        ):
+        )
+
+        # Policy: authoritative terminal status (complete/failed) wins over a
+        # still-alive runner PID. A stale or delayed process exit must not keep
+        # the badge at RUNNING after the selected search finished successfully.
+        if runner_active or heartbeat_running or cross_slice_runner:
             if self._search_run_terminal():
-                badge = "FINISHED"
-                color = "#2b8a3e"
+                if search_failed or phase_aborted:
+                    badge = "INTERRUPTED"
+                    color = "#c92a2a"
+                else:
+                    badge = "FINISHED"
+                    color = "#2b8a3e"
             else:
                 badge = "RUNNING"
                 color = "#0b7285"
         elif scoped_phase_complete or (search_completed and not runner_active):
             badge = "FINISHED"
             color = "#2b8a3e"
-        elif phase_aborted:
+        elif phase_aborted or search_failed:
             badge = "INTERRUPTED"
             color = "#c92a2a"
         elif not search_completed:
@@ -2844,15 +3088,9 @@ class PychmpViewApp:
         if completed_at:
             info_lines.append(f"Search completed: {completed_at}")
         if search_status:
-            if (
-                search_active_flag
-                and search_status == "complete"
-                and runner_active
-                and not self._search_run_terminal()
-            ):
-                info_lines.append("Search status: in_progress (runner active)")
-            else:
-                info_lines.append(f"Search status: {search_status}")
+            # Authoritative ``complete`` is terminal even if a PID is still
+            # alive, so do not rewrite the status line to in_progress.
+            info_lines.append(f"Search status: {search_status}")
         shift_diag = self._diagnostics_with_search_shift(dict(diagnostics))
         info_lines.append(format_search_shift_policy_label(shift_diag))
         info_lines.append(f"Navigation mode: {self._navigation_mode()}")
@@ -2893,6 +3131,8 @@ class PychmpViewApp:
             info_lines.append(f"Last phase: {phase_display}")
         if runner_active:
             info_lines.append(f"Live runner: yes (pid from {self.artifact_h5}.log)" if self.artifact_h5 is not None else "Live runner: yes")
+        elif not search_completed and noncomputed > 0:
+            info_lines.append("Live runner: no (search incomplete; resume or recompute to continue)")
         if heartbeat_slice_key:
             info_lines.append(f"Heartbeat slice key: {heartbeat_slice_key}")
         if (runner_active or cross_slice_runner) and heartbeat_slice_key and not matches_slice:
@@ -3072,7 +3312,7 @@ class PychmpViewApp:
             live_trials["b_index"] = int(resolved[1])
         return live_trials
 
-    def _sync_live_trial_state_from_artifact(self) -> None:
+    def _sync_live_trial_state_from_artifact(self, *, force: bool = False) -> None:
         self._refresh_signal_pending_points = []
         if self._search_run_terminal():
             self._clear_live_runner_state()
@@ -3105,6 +3345,15 @@ class PychmpViewApp:
             or getattr(self, "_refresh_signal_point_id", None)
             or ""
         ).strip() or None
+        if followed_point_id and not force:
+            now = float(time.time())
+            if (
+                followed_point_id == getattr(self, "_last_live_state_sync_point_id", None)
+                and now - float(getattr(self, "_last_live_state_sync_at_s", 0.0))
+                < float(self._LIVE_STATE_SYNC_MIN_INTERVAL_S)
+                and getattr(self, "_refresh_signal_live_trials", None) is not None
+            ):
+                return
         if followed_point_id:
             try:
                 live_state = load_grid_point_live_state(
@@ -3148,6 +3397,8 @@ class PychmpViewApp:
             "metric_name": str(live_state.get("metric_name", self.run_target_metric or "chi2")),
             "slice_key": resolved_slice_key,
             "search_id": resolved_search_id,
+            "point_id": str(live_state.get("point_id", followed_point_id or "")).strip() or None,
+            "grid_point_status": str(live_state.get("grid_point_status", "")).strip(),
             "active_trial_index": None if active_trial_index is None else int(active_trial_index),
             "active_trial_q0": None if active_trial_q0 is None else float(active_trial_q0),
             "fit_q0_trials": fit_q0_trials,
@@ -3160,7 +3411,11 @@ class PychmpViewApp:
             "fit_find_shift_valid_trials": np.asarray(
                 live_state.get("fit_find_shift_valid_trials", ()), dtype=bool
             ),
+            "fit_trial_mask_stages": _sequence_as_list(live_state.get("fit_trial_mask_stages")),
         }
+        if followed_point_id:
+            self._last_live_state_sync_at_s = float(time.time())
+            self._last_live_state_sync_point_id = followed_point_id
 
     def _should_show_active_trial_marker(self, live_state: dict[str, Any] | None) -> bool:
         if live_state is None:
@@ -3539,6 +3794,18 @@ class PychmpViewApp:
             log_scale_check,
             "Apply logarithmic scaling to the heatmap color scale (positive metric values only).",
         )
+        store_dots_check = ttk.Checkbutton(
+            parent,
+            text="Stored maps",
+            variable=self.unvisited_store_dots_var,
+            command=self._on_unvisited_store_dots_changed,
+        )
+        store_dots_check.pack(side=tk.LEFT, padx=(12, 4))
+        self.unvisited_store_dots_check = store_dots_check
+        _ToolTip(
+            store_dots_check,
+            "Red dots for every stored (a, b), the same on every heatmap. Computed cells cover the dots.",
+        )
 
     def _use_heatmap_log_scale(self) -> bool:
         return bool(getattr(self, "heatmap_log_scale_var", None) and self.heatmap_log_scale_var.get())
@@ -3549,6 +3816,109 @@ class PychmpViewApp:
             return
         self._draw_heatmap()
         self.heatmap_canvas.draw_idle()
+
+    def _use_unvisited_store_dots(self) -> bool:
+        return bool(getattr(self, "unvisited_store_dots_var", None) and self.unvisited_store_dots_var.get())
+
+    def _on_unvisited_store_dots_changed(self) -> None:
+        _save_unvisited_store_dots_pref(self._use_unvisited_store_dots())
+        if not self.payload:
+            return
+        self._draw_heatmap()
+        self.heatmap_canvas.draw_idle()
+
+    def _read_unvisited_store_cache_entry(self, artifact: Path, *, path: str, after_row: int, points: set[tuple[float, float]]) -> dict[str, Any]:
+        added, nrows = slice_index_ab_snapshot(Path(artifact), after_row=after_row)
+        if after_row and int(nrows) < after_row:
+            added, nrows = slice_index_ab_snapshot(Path(artifact), after_row=0)
+            points = set()
+        elif not after_row:
+            points = set()
+        else:
+            points = set(points)
+        points.update((float(a_value), float(b_value)) for a_value, b_value in added)
+        return {"path": path, "nrows": int(nrows), "points": points}
+
+    def _cached_unvisited_store_tokens(self, artifact: Path, slice_key: str = "") -> set[tuple[float, float]]:
+        """Cached ``(a, b)`` points for the whole map store.
+
+        The set is not filtered by wavelength. Heatmap redraws reuse it and do
+        not open the index. A missing entry is filled on a background thread
+        when Tk is running.
+        """
+        del slice_key
+        path = str(artifact)
+        cache = getattr(self, "_unvisited_store_dot_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._unvisited_store_dot_cache = cache
+        if cache.get("path") == path and isinstance(cache.get("points"), set):
+            return cache["points"]
+        if getattr(self, "_unvisited_store_dot_load_key", None) == path:
+            pending = cache.get("points")
+            return pending if isinstance(pending, set) else set()
+        root = getattr(self, "root", None)
+        after = getattr(root, "after", None) if root is not None else None
+        if not callable(after):
+            try:
+                filled = self._read_unvisited_store_cache_entry(artifact, path=path, after_row=0, points=set())
+            except Exception:
+                return set()
+            self._unvisited_store_dot_cache = filled
+            filled_points = filled.get("points")
+            return filled_points if isinstance(filled_points, set) else set()
+
+        self._unvisited_store_dot_load_key = path
+
+        def _worker() -> None:
+            filled: dict[str, Any] | None = None
+            try:
+                filled = self._read_unvisited_store_cache_entry(artifact, path=path, after_row=0, points=set())
+            except Exception:
+                filled = None
+
+            def _apply() -> None:
+                # Stale worker (artifact switched while load was in flight): drop result.
+                if getattr(self, "_unvisited_store_dot_load_key", None) != path:
+                    return
+                self._unvisited_store_dot_load_key = None
+                if filled is not None:
+                    self._unvisited_store_dot_cache = filled
+                if not self._use_unvisited_store_dots():
+                    return
+                try:
+                    self._draw_heatmap()
+                    canvas = getattr(self, "heatmap_canvas", None)
+                    if canvas is not None:
+                        canvas.draw_idle()
+                except Exception:
+                    return
+
+            try:
+                after(0, _apply)
+            except Exception:
+                if getattr(self, "_unvisited_store_dot_load_key", None) == path:
+                    self._unvisited_store_dot_load_key = None
+
+        threading.Thread(target=_worker, name="pychmp-store-dots", daemon=True).start()
+        return set()
+
+    def _unvisited_store_dot_centers(self, records: list[dict[str, Any]]) -> tuple[list[float], list[float]]:
+        """Stored ``(a, b)`` points. The same set is drawn on every heatmap."""
+        del records
+        if not self._use_unvisited_store_dots():
+            return [], []
+        artifact = getattr(self, "artifact_h5", None)
+        if artifact is None:
+            return [], []
+        try:
+            stored_points = self._cached_unvisited_store_tokens(Path(artifact))
+        except Exception:
+            return [], []
+        if not stored_points:
+            return [], []
+        ordered = sorted(stored_points)
+        return [float(a_value) for a_value, _b_value in ordered], [float(b_value) for _a_value, b_value in ordered]
 
     def _refresh_shared_heatmap_extents(self) -> None:
         self._shared_heatmap_extents = None
@@ -4304,7 +4674,7 @@ class PychmpViewApp:
             self._preferred_initial_metric = None
             return
 
-        if not getattr(self, "_open_session_prefers_active", False):
+        if not getattr(self, "_open_session_prefers_active", False) and not getattr(self, "_navigation_mode_user_chosen", False):
             saved_mode = str(state.get("navigation_mode", "") or "").strip().lower()
             if saved_mode == "active" and not self._active_navigation_mode_available():
                 saved_mode = "best" if self._best_navigation_available() else "free"
@@ -4357,7 +4727,14 @@ class PychmpViewApp:
         labels = [self._slice_label(item) for item in descriptors]
         keys = [str(item.get("key", "")) for item in descriptors]
         labels = self._unique_menu_labels(labels, keys)
-        selected_key = str(self.payload.get("selected_slice_key", self._selected_slice_key() or "")).strip()
+        ui_slice_key = str(self._selected_slice_key() or "").strip()
+        payload_slice_key = str(self.payload.get("selected_slice_key", "") or "").strip()
+        if ui_slice_key and ui_slice_key in keys:
+            selected_key = ui_slice_key
+        elif payload_slice_key and payload_slice_key in keys:
+            selected_key = payload_slice_key
+        else:
+            selected_key = ""
         if selected_key and selected_key in keys:
             selected_index = keys.index(selected_key)
         else:
@@ -4396,6 +4773,12 @@ class PychmpViewApp:
         return f"{search_id}{suffix}"
 
     def _refresh_search_controls(self) -> None:
+        # A user-selected slice may still be loading. Its search selector must
+        # not be repopulated from the previous slice's search catalog.
+        loaded_slice = str(self.payload.get("selected_slice_key", "") or "").strip()
+        selected_slice = str(self._selected_slice_key() or "").strip()
+        if loaded_slice and selected_slice and loaded_slice != selected_slice:
+            return
         records = list(getattr(self, "available_searches", []) or [])
         labels = [self._search_label(record) for record in records]
         ids = [str(record.get("search_id", "")) for record in records]
@@ -4454,6 +4837,8 @@ class PychmpViewApp:
                 self._navigation_mode_user_chosen = False
                 self._open_global_best_applied = False
                 self._stale_active_notice = ""
+                self._unvisited_store_dot_cache = {}
+                self._unvisited_store_dot_load_key = None
             try:
                 self.artifact_h5 = resolved_path
             except Exception:
@@ -4484,6 +4869,8 @@ class PychmpViewApp:
             self._live_snapshot_cache_value = None
             self._selected_trial_map_cache_key = None
             self._selected_trial_map_cache_value = None
+            self._unvisited_store_dot_cache = {}
+            self._unvisited_store_dot_load_key = None
             self._navigation_mode_initialized = False
             self._navigation_mode_user_chosen = False
             self._open_global_best_applied = False
@@ -4516,6 +4903,8 @@ class PychmpViewApp:
             self._live_snapshot_cache_value = None
             self._selected_trial_map_cache_key = None
             self._selected_trial_map_cache_value = None
+            self._unvisited_store_dot_cache = {}
+            self._unvisited_store_dot_load_key = None
         cache_key = (str(requested_slice_key or ""), str(requested_search_id or ""))
         cached_payload = self._payload_cache_by_selection.get(cache_key)
         if cached_payload is not None and requested_search_id:
@@ -4523,30 +4912,34 @@ class PychmpViewApp:
             if cached_search_id and cached_search_id != str(requested_search_id).strip():
                 cached_payload = None
                 self._payload_cache_by_selection.pop(cache_key, None)
-        try:
-            if cached_payload is not None:
-                self.payload = cached_payload
-            else:
-                self.payload = self._load_scan_file_with_retries(
-                    self.artifact_h5,
-                    slice_key=requested_slice_key,
-                    search_id=requested_search_id,
-                )
-        except Exception as exc:
+        if cached_payload is not None:
+            self._apply_payload(cached_payload)
+            return
+
+        def _apply_loaded_payload(payload: dict[str, Any]) -> None:
+            selected_cache_key = (
+                str(payload.get("selected_slice_key", "") or ""),
+                str(payload.get("selected_search_id", "") or ""),
+            )
+            self._payload_cache_by_selection[cache_key] = payload
+            self._payload_cache_by_selection[selected_cache_key] = payload
+            self._apply_payload(payload)
+            self._drain_pending_refresh_signal()
+
+        def _report_load_error(exc: Exception) -> None:
             self.status_var.set(
                 "Artifact is currently being written or is temporarily locked. "
                 "Please retry in a moment.\n"
                 f"Details: {exc}"
             )
             self.summary_var.set("Could not refresh artifact right now. Existing view remains unchanged.")
-            return
-        selected_cache_key = (
-            str(self.payload.get("selected_slice_key", "") or ""),
-            str(self.payload.get("selected_search_id", "") or ""),
+
+        self._schedule_background_scan_load(
+            slice_key=requested_slice_key,
+            search_id=requested_search_id,
+            on_success=_apply_loaded_payload,
+            on_error=_report_load_error,
         )
-        self._payload_cache_by_selection[cache_key] = self.payload
-        self._payload_cache_by_selection[selected_cache_key] = self.payload
-        self._apply_payload(self.payload)
 
     def _apply_payload(self, payload: dict[str, Any]) -> None:
         self.payload = payload
@@ -4568,8 +4961,18 @@ class PychmpViewApp:
             if target_search_id:
                 self.search_id_var.set(str(target_search_id))
         else:
-            self.slice_key_var.set(str(self.payload.get("selected_slice_key", "")))
-            self.search_id_var.set(str(self.payload.get("selected_search_id") or ""))
+            loaded_slice_key = str(self.payload.get("selected_slice_key", "") or "").strip()
+            ui_slice_key = str(self._selected_slice_key() or "").strip()
+            if self._navigation_mode() == "free" and ui_slice_key:
+                self.slice_key_var.set(ui_slice_key)
+            else:
+                self.slice_key_var.set(loaded_slice_key)
+            ui_search_id = str(self._selected_search_id() or "").strip()
+            loaded_search_id = str(self.payload.get("selected_search_id") or "").strip()
+            if self._navigation_mode() == "free" and ui_search_id:
+                self.search_id_var.set(ui_search_id)
+            else:
+                self.search_id_var.set(loaded_search_id)
         self.a_values = np.asarray(self.payload["a_values"], dtype=float)
         self.b_values = np.asarray(self.payload["b_values"], dtype=float)
         self.display_model = build_patch_grid_model(self.payload)
@@ -4597,6 +5000,52 @@ class PychmpViewApp:
         self._live_snapshot_cache_value = None
         self._selected_trial_map_cache_key = None
         self._selected_trial_map_cache_value = None
+        self._pin_slice_psf_kernel()
+
+    def _pin_slice_psf_kernel(self) -> None:
+        slice_key = str(self.payload.get("selected_slice_key", "") or "").strip()
+        if not slice_key:
+            return
+        cache = getattr(self, "_slice_psf_kernel_by_key", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._slice_psf_kernel_by_key = cache
+        kernel = self.payload.get("psf_kernel")
+        if kernel is not None:
+            cache[slice_key] = np.asarray(kernel, dtype=float)
+        elif slice_key not in cache:
+            cache[slice_key] = None
+
+    def _cached_slice_psf_kernel(self) -> np.ndarray | None:
+        slice_key = str(self.payload.get("selected_slice_key", "") or "").strip()
+        cache = getattr(self, "_slice_psf_kernel_by_key", None)
+        if slice_key and isinstance(cache, dict) and slice_key in cache:
+            return cache.get(slice_key)
+        kernel = self.payload.get("psf_kernel")
+        if kernel is not None:
+            return np.asarray(kernel, dtype=float)
+        return None
+
+    def _trial_map_cache_mtime_token(self) -> int:
+        if not self._live_runner_detected():
+            return -1
+        live_state = self._live_trial_state()
+        if live_state is None:
+            return -1
+        try:
+            a_index = int(self.a_index_var.get())
+            b_index = int(self.b_index_var.get())
+        except Exception:
+            return -1
+        if not self._selection_matches_live_active_point(a_index, b_index):
+            return -1
+        artifact_h5 = getattr(self, "artifact_h5", None)
+        if artifact_h5 is None:
+            return -1
+        try:
+            return int(Path(artifact_h5).stat().st_mtime_ns)
+        except Exception:
+            return -1
 
     def _schedule_payload_reload(self, *, status_text: str | None = None) -> None:
         if self._scheduled_reload_after_id is not None:
@@ -4616,7 +5065,56 @@ class PychmpViewApp:
 
         self._scheduled_reload_after_id = self.root.after_idle(_run)
 
-    def _load_scan_file_with_retries(
+    def _schedule_refresh_all(
+        self,
+        *,
+        update_selected_solution: bool = True,
+        scope: str = "full",
+    ) -> None:
+        pending_scope = str(getattr(self, "_pending_refresh_scope", "full") or "full")
+        if scope == "selection" and pending_scope == "full":
+            pass
+        elif scope == "full":
+            self._pending_refresh_scope = "full"
+        if bool(getattr(self, "_pending_refresh_all_update_solution", False)) or update_selected_solution:
+            self._pending_refresh_all_update_solution = True
+        if getattr(self, "_refresh_all_after_id", None) is not None:
+            return
+
+        def _run() -> None:
+            self._refresh_all_after_id = None
+            if self._is_closing:
+                self._pending_refresh_all_update_solution = False
+                self._pending_refresh_scope = "full"
+                return
+            update = bool(self._pending_refresh_all_update_solution)
+            refresh_scope = str(getattr(self, "_pending_refresh_scope", "full") or "full")
+            self._pending_refresh_all_update_solution = False
+            self._pending_refresh_scope = "full"
+            self._refresh_all(update_selected_solution=update, scope=refresh_scope)
+
+        root = getattr(self, "root", None)
+        after_idle = getattr(root, "after_idle", None)
+        if not callable(after_idle):
+            update = bool(getattr(self, "_pending_refresh_all_update_solution", False))
+            refresh_scope = str(getattr(self, "_pending_refresh_scope", "full") or "full")
+            self._pending_refresh_all_update_solution = False
+            self._pending_refresh_scope = "full"
+            self._refresh_all(update_selected_solution=update, scope=refresh_scope)
+            return
+
+        self._refresh_all_after_id = after_idle(_run)
+
+    def _refresh_free_selection_views(self) -> None:
+        """Refresh trials/summary from in-memory payload only (Free-mode clicks)."""
+        if not self.payload:
+            return
+        self._draw_trials()
+        self._refresh_summary(include_map_diagnostics=False)
+        self._update_heatmap_selection_marker()
+        self.trials_canvas.draw_idle()
+
+    def _load_scan_file_blocking(
         self,
         artifact_h5: Path,
         *,
@@ -4631,14 +5129,126 @@ class PychmpViewApp:
                 last_exc = exc
                 if attempt >= self._LOAD_RETRY_ATTEMPTS:
                     break
-                self.status_var.set(
-                    "Artifact is busy (possibly being written); "
-                    f"retrying {attempt}/{self._LOAD_RETRY_ATTEMPTS - 1}..."
-                )
                 time.sleep(self._LOAD_RETRY_DELAY_S)
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("unknown artifact loading failure")
+
+    def _load_scan_file_with_retries(
+        self,
+        artifact_h5: Path,
+        *,
+        slice_key: str | None = None,
+        search_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._load_scan_file_blocking(
+            artifact_h5,
+            slice_key=slice_key,
+            search_id=search_id,
+        )
+
+    def _schedule_background_scan_load(
+        self,
+        *,
+        slice_key: str | None,
+        search_id: str | None,
+        on_success: Callable[[dict[str, Any]], None],
+        on_error: Callable[[Exception], None] | None = None,
+        invalidate_selection_cache: bool = False,
+    ) -> None:
+        if self._is_closing or self.artifact_h5 is None:
+            return
+        request = {
+            "slice_key": slice_key,
+            "search_id": search_id,
+            "on_success": on_success,
+            "on_error": on_error,
+            "invalidate_selection_cache": bool(invalidate_selection_cache),
+        }
+        if self._payload_reload_in_progress:
+            self._deferred_scan_load_request = request
+            return
+        self._payload_reload_in_progress = True
+        self._payload_reload_token += 1
+        token = int(self._payload_reload_token)
+        selection_at_start = (slice_key or self._selected_slice_key(), search_id or self._selected_search_id())
+        try:
+            artifact_path = Path(self.artifact_h5).expanduser().resolve()
+        except Exception:
+            artifact_path = Path(self.artifact_h5)
+
+        if invalidate_selection_cache:
+            cache_key = (str(slice_key or ""), str(search_id or ""))
+            self._payload_cache_by_selection.pop(cache_key, None)
+
+        def _worker() -> None:
+            payload: dict[str, Any] | None = None
+            error: Exception | None = None
+            try:
+                payload = self._load_scan_file_blocking(
+                    artifact_path,
+                    slice_key=slice_key,
+                    search_id=search_id,
+                )
+            except Exception as exc:
+                error = exc
+
+            def _apply_result() -> None:
+                if self._is_closing:
+                    self._payload_reload_in_progress = False
+                    return
+                if int(self._payload_reload_token) != token:
+                    return
+                self._payload_reload_in_progress = False
+                selection_unchanged = selection_at_start == (self._selected_slice_key(), self._selected_search_id())
+                artifact_unchanged = self.artifact_h5 is not None and Path(self.artifact_h5).expanduser().resolve() == artifact_path
+                if not selection_unchanged or not artifact_unchanged:
+                    pass  # Discard obsolete results; the latest queued load runs below.
+                elif error is not None:
+                    if on_error is not None:
+                        on_error(error)
+                elif payload is not None:
+                    on_success(payload)
+                deferred = self._deferred_scan_load_request
+                self._deferred_scan_load_request = None
+                if deferred is not None and not self._is_closing:
+                    self._schedule_background_scan_load(
+                        slice_key=deferred.get("slice_key"),
+                        search_id=deferred.get("search_id"),
+                        on_success=deferred["on_success"],
+                        on_error=deferred.get("on_error"),
+                        invalidate_selection_cache=bool(deferred.get("invalidate_selection_cache")),
+                    )
+
+            try:
+                self.root.after(0, _apply_result)
+            except Exception:
+                self._payload_reload_in_progress = False
+
+        threading.Thread(target=_worker, name="pychmp-view-scan-load", daemon=True).start()
+
+    def _drain_pending_refresh_signal(self) -> None:
+        pending = dict(self._pending_refresh_signal_payload or {})
+        self._pending_refresh_signal_payload = None
+        if not pending:
+            return
+        event = str(pending.get("event", "") or "").strip().lower()
+        version = int(pending.get("version", 1) or 1)
+        if version >= 2 and event in REFRESH_EVENTS_REQUIRING_SLICE_RELOAD:
+            self._process_refresh_event(pending)
+            return
+        if self._heartbeat_requires_payload_reload(pending):
+            self._schedule_payload_reload()
+            return
+        self._apply_refresh_signal_payload(pending)
+        self._sync_live_trial_state_from_artifact()
+        if self._navigation_mode() in {"active", "best"}:
+            if self._apply_locked_navigation_selection():
+                return
+        self._refresh_scan_state_display()
+        self._refresh_action_states()
+        if self._navigation_mode() in {"active", "best"} and self.payload:
+            self._schedule_refresh_all(update_selected_solution=True)
 
     def _poll_external_refresh_signal(self) -> None:
         self._external_refresh_after_id = None
@@ -4657,10 +5267,12 @@ class PychmpViewApp:
                     self._refresh_signal_phase = str(refresh_payload.get("phase", ""))
                     event = str(refresh_payload.get("event", "") or "").strip().lower()
                     version = int(refresh_payload.get("version", 1) or 1)
-                    if version >= 2 and event in REFRESH_EVENTS_REQUIRING_SLICE_RELOAD:
+                    if bool(getattr(self, "_payload_reload_in_progress", False)):
+                        self._pending_refresh_signal_payload = dict(refresh_payload)
+                    elif version >= 2 and event in REFRESH_EVENTS_REQUIRING_SLICE_RELOAD:
                         self._process_refresh_event(refresh_payload)
                     elif self._heartbeat_requires_payload_reload(refresh_payload):
-                        self._reload_payload()
+                        self._schedule_payload_reload()
                     else:
                         self._apply_refresh_signal_payload(refresh_payload)
                         self._sync_live_trial_state_from_artifact()
@@ -4670,7 +5282,7 @@ class PychmpViewApp:
                         self._refresh_scan_state_display()
                         self._refresh_action_states()
                         if self._navigation_mode() in {"active", "best"} and self.payload:
-                            self._refresh_all(update_selected_solution=True)
+                            self._schedule_refresh_all(update_selected_solution=True)
         except Exception:
             pass
         finally:
@@ -4806,22 +5418,32 @@ class PychmpViewApp:
         diagnostics.update(self._selected_point()["diagnostics"])
         return self._diagnostics_with_search_shift(diagnostics)
 
+    def _apply_search_recipe_fields_to_display_diagnostics(self, diagnostics: dict[str, Any]) -> dict[str, Any]:
+        """Copy stored search recipe fields into point display diagnostics (artifact-only)."""
+        out = dict(diagnostics)
+        selected_search = dict(self.payload.get("selected_search") or {})
+        search_request = dict(selected_search.get("request") or {})
+        search_diagnostics = dict(selected_search.get("diagnostics") or {})
+        for key in ("q0_search_stages", "mask_type", "metrics_mask_threshold", "metrics_mask_source"):
+            if out.get(key) not in (None, "", []):
+                continue
+            value = search_request.get(key)
+            if value in (None, "", []):
+                value = search_diagnostics.get(key)
+            if value not in (None, "", []):
+                out[key] = value
+        if not str(out.get("grid_point_status", "")).strip():
+            for source in (search_diagnostics, dict(self.payload.get("diagnostics") or {})):
+                live_status = str(source.get("grid_point_status", "")).strip()
+                if live_status:
+                    out["grid_point_status"] = live_status
+                    break
+        if "use_smoothed_obs_max" not in out and "use_smoothed_obs_max" in search_diagnostics:
+            out["use_smoothed_obs_max"] = search_diagnostics.get("use_smoothed_obs_max")
+        return out
+
     def _metrics_mask_summary(self, diagnostics: dict[str, Any]) -> str | None:
-        source = str(diagnostics.get("metrics_mask_source", "")).strip().lower()
-        if source == "explicit_fits":
-            mask_path = str(diagnostics.get("metrics_mask_fits", "")).strip()
-            return f"explicit FITS: {mask_path}" if mask_path else "explicit FITS"
-        threshold = diagnostics.get("metrics_mask_threshold")
-        try:
-            threshold_value = float(threshold)
-        except Exception:
-            threshold_value = float("nan")
-        if np.isfinite(threshold_value):
-            return f"union threshold={threshold_value:.3f} + observed>0"
-        mask_type = str(diagnostics.get("mask_type", "")).strip()
-        if mask_type:
-            return mask_type
-        return None
+        return format_metrics_mask_label(diagnostics)
 
     def _tr_mask_summary(self, diagnostics: dict[str, Any]) -> str | None:
         source = str(diagnostics.get("tr_mask_source", "")).strip().lower()
@@ -4854,6 +5476,8 @@ class PychmpViewApp:
         return np.asarray(modeled_trial_maps[int(selected_trial_index)], dtype=float)
 
     def _metrics_mask_pixel_summary(self, point: dict[str, Any], diagnostics: dict[str, Any]) -> str | None:
+        if "modeled_best" not in point:
+            return None
         observed = np.asarray(self.payload.get("observed"), dtype=float)
         modeled = self._selected_modeled_map_for_mask(point)
         if observed.shape != modeled.shape:
@@ -4873,7 +5497,9 @@ class PychmpViewApp:
             except Exception:
                 return "unavailable"
         else:
-            mask_type = str(diagnostics.get("mask_type", "union")).strip() or "union"
+            mask_type = resolve_metrics_mask_type(diagnostics)
+            if mask_type == METRICS_MASK_STAGE_UNKNOWN:
+                return "unavailable (committed mask stage unknown)"
             threshold_value = diagnostics.get("metrics_mask_threshold", diagnostics.get("threshold", 0.1))
             try:
                 threshold = float(threshold_value)
@@ -4931,6 +5557,34 @@ class PychmpViewApp:
                 if arr.ndim == 1 and arr.size > 0:
                     diagnostics[key] = [float(v) for v in arr]
         return display_metric
+
+    @staticmethod
+    def _point_has_committed_trial_history(
+        q0_trials: np.ndarray,
+        metric_trials: np.ndarray,
+    ) -> bool:
+        return (
+            q0_trials.size > 0
+            and metric_trials.size == q0_trials.size
+            and np.any(np.isfinite(metric_trials))
+        )
+
+    @staticmethod
+    def _heatmap_record_has_finite_metric(
+        record: dict[str, Any],
+        metric_name: str,
+        *,
+        log_scale: bool,
+    ) -> bool:
+        try:
+            value = float(record.get("metrics", {}).get(metric_name, np.nan))
+        except Exception:
+            return False
+        if not np.isfinite(value):
+            return False
+        if log_scale:
+            return value > 0.0
+        return True
 
     def _trial_series_for_point(self, point: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, str]:
         q0_trials = np.asarray(point.get("fit_q0_trials", ()), dtype=float)
@@ -5053,7 +5707,7 @@ class PychmpViewApp:
             b_token=token[1],
             point_metric=point_metric,
         )
-        if force_best:
+        if force_best or self._metrics_pointer_locked():
             current_index = 0 if display_best_index is None else int(display_best_index)
         elif (
             not token_matches_context
@@ -5062,13 +5716,6 @@ class PychmpViewApp:
         ):
             default_index = self._default_trial_index_for_point(point, q0_trials, metric_trials)
             current_index = 0 if default_index is None else int(default_index)
-        elif (
-            self._navigation_mode() != "free"
-            and display_best_index is not None
-            and 0 <= current_index < metric_trials.size
-            and not np.isfinite(float(metric_trials[current_index]))
-        ):
-            current_index = int(display_best_index)
         if trial_index_var is not None and int(trial_index_var.get()) != int(current_index):
             trial_index_var.set(int(current_index))
         self._selected_trial_token = token
@@ -5128,7 +5775,7 @@ class PychmpViewApp:
                     self.trial_slider.configure(
                         from_=0.0,
                         to=float(max(0, len(q0_trials) - 1)),
-                        state=tk.NORMAL,
+                        state=(tk.DISABLED if self._metrics_pointer_locked() else tk.NORMAL),
                     )
                     self.trial_slider.set(float(selected_index))
                 else:
@@ -5137,7 +5784,8 @@ class PychmpViewApp:
             finally:
                 self._updating_trial_slider = False
         if self.trial_best_button is not None:
-            self.trial_best_button.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+            pointer_movable = enabled and not self._metrics_pointer_locked()
+            self.trial_best_button.configure(state=(tk.NORMAL if pointer_movable else tk.DISABLED))
 
     def _clear_trial_selector_controls(self) -> None:
         self._selected_trial_token = None
@@ -5154,6 +5802,8 @@ class PychmpViewApp:
             self.trial_best_button.configure(state=tk.DISABLED)
 
     def _jump_to_best_trial(self) -> None:
+        if self._metrics_pointer_locked():
+            return
         live_state = self._live_trial_state()
         use_live_trials = self._should_force_live_trials(live_state) or self._should_use_live_trials(live_state)
         if self._has_selected_point() and not use_live_trials:
@@ -5182,7 +5832,7 @@ class PychmpViewApp:
         self._refresh_all()
 
     def _on_trial_slider_changed(self, value: str) -> None:
-        if self._updating_trial_slider:
+        if self._updating_trial_slider or self._metrics_pointer_locked():
             return
         live_state = self._live_trial_state()
         use_live_trials = self._should_force_live_trials(live_state) or self._should_use_live_trials(live_state)
@@ -5228,7 +5878,12 @@ class PychmpViewApp:
                             live_diag["fit_find_shift_valid_trials"] = _sequence_as_list(
                                 point.get("fit_find_shift_valid_trials")
                             )
+                        if not _sequence_as_list(live_diag.get("fit_trial_mask_stages")):
+                            live_diag["fit_trial_mask_stages"] = _sequence_as_list(
+                                point.get("fit_trial_mask_stages")
+                            )
                         live_diag = self._diagnostics_with_point_ab(live_diag, point)
+                        live_diag = self._apply_search_recipe_fields_to_display_diagnostics(live_diag)
                         live_context = {**live_context, "diagnostics": live_diag}
                     except KeyError:
                         pass
@@ -5240,7 +5895,12 @@ class PychmpViewApp:
         search_diagnostics = dict((self.payload.get("selected_search") or {}).get("diagnostics") or {})
         if "use_smoothed_obs_max" in search_diagnostics:
             diagnostics["use_smoothed_obs_max"] = search_diagnostics.get("use_smoothed_obs_max")
+        diagnostics = self._apply_search_recipe_fields_to_display_diagnostics(diagnostics)
         diagnostics["fit_trial_mask_stages"] = list(point.get("fit_trial_mask_stages") or ())
+        point_diag = dict(point.get("diagnostics") or {})
+        diagnostics["grid_point_status"] = str(
+            point_diag.get("grid_point_status") or point.get("status") or ""
+        ).strip()
         diagnostics["fit_shift_x_trials"] = _sequence_as_list(point.get("fit_shift_x_trials"))
         diagnostics["fit_shift_y_trials"] = _sequence_as_list(point.get("fit_shift_y_trials"))
         diagnostics["fit_find_shift_valid_trials"] = _sequence_as_list(point.get("fit_find_shift_valid_trials"))
@@ -5331,6 +5991,17 @@ class PychmpViewApp:
                     residual = None
         if raw_modeled is None or modeled is None or residual is None:
             return None
+        display_observed = self._display_observation_for_trial(
+            point=point,
+            trial_index=int(selected_trial_index) if selected_trial_index is not None else None,
+            diagnostics=diagnostics,
+        )
+        if not (
+            _valid_display_map_array(display_observed)
+            and _valid_display_map_array(raw_modeled)
+            and _valid_display_map_array(modeled)
+        ):
+            return None
         slice_descriptor = dict(self.payload.get("selected_slice") or {})
         slice_label = self._slice_label(slice_descriptor) if slice_descriptor else "single slice"
         frequency_ghz = None
@@ -5345,13 +6016,10 @@ class PychmpViewApp:
             if np.isfinite(numeric):
                 frequency_ghz = numeric
                 break
-        display_observed = self._display_observation_for_trial(
-            point=point,
-            trial_index=int(selected_trial_index) if selected_trial_index is not None else None,
-            diagnostics=diagnostics,
-        )
         if modeled is not None:
             residual = np.asarray(modeled, dtype=float) - np.asarray(display_observed, dtype=float)
+        if not _valid_display_map_array(residual):
+            return None
         return {
             "model_path": Path(str(diagnostics.get("model_path", ""))),
             "observed_noisy": np.asarray(display_observed, dtype=float),
@@ -5361,7 +6029,7 @@ class PychmpViewApp:
             "wcs_header": self.payload.get("wcs_header"),
             "frequency_ghz": frequency_ghz,
             "diagnostics": diagnostics,
-            "psf_kernel": self.payload.get("psf_kernel"),
+            "psf_kernel": self._cached_slice_psf_kernel(),
             "slice_label": slice_label,
             "blos_reference": self.payload.get("blos_reference"),
             **self._trials_axis_view_from_parent(),
@@ -5455,7 +6123,7 @@ class PychmpViewApp:
         else:
             return None
 
-        psf_kernel = self.payload.get("psf_kernel")
+        psf_kernel = self._cached_slice_psf_kernel()
         if psf_kernel is not None:
             kernel = np.asarray(psf_kernel, dtype=float)
             if kernel.ndim == 2 and kernel.size:
@@ -5525,10 +6193,6 @@ class PychmpViewApp:
         search_id = str(self.payload.get("selected_search_id", "")).strip() or None
         if slice_key is None:
             return None
-        try:
-            artifact_mtime_ns = int(Path(artifact_h5).stat().st_mtime_ns)
-        except Exception:
-            artifact_mtime_ns = -1
         cache_key = (
             str(Path(artifact_h5)),
             str(slice_key),
@@ -5536,7 +6200,7 @@ class PychmpViewApp:
             float(a_value),
             float(b_value),
             -1 if selected_trial_index is None else int(selected_trial_index),
-            int(artifact_mtime_ns),
+            int(self._trial_map_cache_mtime_token()),
         )
         if cache_key == getattr(self, "_selected_trial_map_cache_key", None):
             return getattr(self, "_selected_trial_map_cache_value", None)
@@ -5548,6 +6212,7 @@ class PychmpViewApp:
                 trial_index=selected_trial_index,
                 slice_key=slice_key,
                 search_id=search_id,
+                psf_kernel=self._cached_slice_psf_kernel(),
             )
         except Exception:
             payload = None
@@ -5648,9 +6313,13 @@ class PychmpViewApp:
             return None
 
         current_index = int(np.clip(int(self.trial_index_var.get()), 0, max(0, int(q0_trials.size) - 1)))
+        best_index = self._best_trial_index_from_metric(metric_trials)
+        if self._metrics_pointer_locked() and best_index is not None:
+            current_index = int(best_index)
+            if int(self.trial_index_var.get()) != current_index:
+                self.trial_index_var.set(current_index)
         selected_q0 = float(q0_trials[current_index])
         selected_metric = float(metric_trials[current_index])
-        best_index = self._best_trial_index_from_metric(metric_trials)
         best_q0 = float(q0_trials[int(best_index)]) if best_index is not None else selected_q0
 
         active_coords = self._live_active_ab(live_state)
@@ -5666,6 +6335,8 @@ class PychmpViewApp:
                 "fit_shift_x_trials": _sequence_as_list(live_state.get("fit_shift_x_trials")),
                 "fit_shift_y_trials": _sequence_as_list(live_state.get("fit_shift_y_trials")),
                 "fit_find_shift_valid_trials": _sequence_as_list(live_state.get("fit_find_shift_valid_trials")),
+                "fit_trial_mask_stages": _sequence_as_list(live_state.get("fit_trial_mask_stages")),
+                "grid_point_status": str(live_state.get("grid_point_status", "")).strip(),
                 "selected_trial_index": int(current_index),
                 "selected_trial_count": int(q0_trials.size),
                 "selected_trial_q0": float(selected_q0),
@@ -5676,6 +6347,7 @@ class PychmpViewApp:
                 "best_q0_recovered": float(best_q0),
             }
         )
+        diagnostics = self._apply_search_recipe_fields_to_display_diagnostics(diagnostics)
         saved_point = self._selected_point() if self._has_saved_selected_point() else None
         display_metric = self._populate_metric_trial_histories_in_diagnostics(
             diagnostics,
@@ -5705,7 +6377,7 @@ class PychmpViewApp:
                 raw_trials_arr = np.asarray(raw_trials, dtype=float)
                 if raw_trials_arr.ndim == 3 and raw_trials_arr.shape[0] == q0_trials.size and current_index < raw_trials_arr.shape[0]:
                     raw_modeled = np.asarray(raw_trials_arr[current_index], dtype=float)
-                    modeled = _convolve_raw_map(raw_modeled, self.payload.get("psf_kernel"))
+                    modeled = _convolve_raw_map(raw_modeled, self._cached_slice_psf_kernel())
                     display_observed = self._display_observation_for_trial(
                         trial_index=int(current_index),
                         diagnostics=diagnostics,
@@ -5756,7 +6428,7 @@ class PychmpViewApp:
             "wcs_header": self.payload["wcs_header"],
             "frequency_ghz": frequency_ghz,
             "diagnostics": diagnostics,
-            "psf_kernel": self.payload.get("psf_kernel"),
+            "psf_kernel": self._cached_slice_psf_kernel(),
             "slice_label": slice_label,
             "blos_reference": self.payload.get("blos_reference"),
             **self._trials_axis_view_from_parent(),
@@ -5838,6 +6510,8 @@ class PychmpViewApp:
         self._refresh_all()
 
     def _on_trials_canvas_click(self, event: Any) -> None:
+        if self._metrics_pointer_locked():
+            return
         if event.inaxes is not self.ax_trials or event.xdata is None:
             return
         live_state = self._live_trial_state()
@@ -5867,7 +6541,10 @@ class PychmpViewApp:
             selected_index = int(np.nanargmin(distances))
         self.trial_index_var.set(selected_index)
         self._selected_trial_token = token
-        self._refresh_all()
+        if self._navigation_mode() == "free":
+            self._refresh_free_selection_views()
+        else:
+            self._schedule_refresh_all()
 
     def _on_canvas_click(self, event: Any) -> None:
         if self._navigation_mode() != "free":
@@ -5884,7 +6561,7 @@ class PychmpViewApp:
             self._selected_trial_token = None
             self._refresh_selector_values()
             self._refresh_action_states()
-            self._refresh_all()
+            self._refresh_free_selection_views()
             return
         record = find_record_for_point(self.display_model, click_a, click_b)
         if record is not None:
@@ -5903,7 +6580,7 @@ class PychmpViewApp:
         self._selected_trial_token = None
         self._refresh_selector_values()
         self._refresh_action_states()
-        self._refresh_all()
+        self._refresh_free_selection_views()
 
     def _active_point_indices_from_heatmap_click(self, xdata: float, ydata: float) -> tuple[int, int] | None:
         live_state = self._live_trial_state()
@@ -5937,7 +6614,16 @@ class PychmpViewApp:
             return None
         return resolved
 
-    def _refresh_all(self, *, update_selected_solution: bool = True) -> None:
+    def _refresh_all(self, *, update_selected_solution: bool = True, scope: str = "full") -> None:
+        selection_only = str(scope or "full").strip().lower() == "selection"
+        if selection_only:
+            if not self.payload:
+                return
+            self._draw_trials()
+            self._refresh_summary(include_map_diagnostics=False)
+            self._update_heatmap_selection_marker()
+            self.trials_canvas.draw_idle()
+            return
         if self.payload and not self._ensure_payload_matches_search_selection():
             return
         if not self.payload:
@@ -6054,6 +6740,83 @@ class PychmpViewApp:
             )
         return model
 
+    def _heatmap_selection_locked(self) -> bool:
+        return (
+            self._navigation_mode() == "active"
+            and getattr(self, "_refresh_signal_active_point", None) is not None
+        )
+
+    def _heatmap_selection_marker_coords(self) -> tuple[float, float] | None:
+        if self._heatmap_selection_locked():
+            return None
+        display_model = self._heatmap_display_model()
+        records = list(display_model.get("records", []))
+        record_lookup = {(int(record["a_index"]), int(record["b_index"])): record for record in records}
+        current_a_value: float | None = None
+        current_b_value: float | None = None
+        if self._navigation_mode() == "free":
+            free_ab = self._free_grid_selection_ab()
+            if free_ab is not None:
+                current_a_value, current_b_value = float(free_ab[0]), float(free_ab[1])
+        if current_a_value is None or current_b_value is None:
+            current_a = int(self.a_index_var.get())
+            current_b = int(self.b_index_var.get())
+            current_record = record_lookup.get((current_a, current_b))
+            if current_record is not None:
+                current_b_value = float(current_record["b_center"])
+                current_a_value = float(current_record["a_center"])
+            elif 0 <= int(current_a) < int(self.a_values.size) and 0 <= int(current_b) < int(self.b_values.size):
+                current_b_value = float(self.b_values[current_b])
+                current_a_value = float(self.a_values[current_a])
+        if current_a_value is None or current_b_value is None:
+            return None
+        if not (np.isfinite(current_a_value) and np.isfinite(current_b_value)):
+            return None
+        return float(current_a_value), float(current_b_value)
+
+    def _clear_heatmap_selection_artists(self) -> None:
+        for artist in list(getattr(self, "_heatmap_selection_artists", ()) or ()):
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._heatmap_selection_artists = []
+
+    def _draw_heatmap_selection_marker(self) -> bool:
+        coords = self._heatmap_selection_marker_coords()
+        self._clear_heatmap_selection_artists()
+        if coords is None:
+            return False
+        current_a_value, current_b_value = coords
+        artists = [
+            self.ax_heatmap.scatter(
+                [current_a_value],
+                [current_b_value],
+                s=170,
+                marker="x",
+                color="black",
+                linewidth=3.6,
+                zorder=7,
+            ),
+            self.ax_heatmap.scatter(
+                [current_a_value],
+                [current_b_value],
+                s=120,
+                marker="x",
+                color="white",
+                linewidth=2.2,
+                zorder=8,
+            ),
+        ]
+        self._heatmap_selection_artists = list(artists)
+        return True
+
+    def _update_heatmap_selection_marker(self) -> None:
+        if getattr(self, "ax_heatmap", None) is None or getattr(self, "heatmap_canvas", None) is None:
+            return
+        if self._draw_heatmap_selection_marker():
+            self.heatmap_canvas.draw_idle()
+
     def _draw_heatmap(self) -> None:
         metric_name = self._heatmap_display_metric()
         display_model = self._heatmap_display_model()
@@ -6061,13 +6824,37 @@ class PychmpViewApp:
         record_lookup = {(int(record["a_index"]), int(record["b_index"])): record for record in records}
         self._reset_heatmap_colorbar()
         self.ax_heatmap.clear()
-        computed_records = [
-            record
-            for record in records
-            if str(record.get("status", "computed")).strip().lower() not in {"pending", "missing"}
-            and not bool(record.get("live_pending"))
-        ]
-        pending_records = [record for record in records if record not in computed_records]
+        self._heatmap_selection_artists = []
+        log_scale = self._use_heatmap_log_scale()
+        computed_records: list[dict[str, Any]] = []
+        pending_records: list[dict[str, Any]] = []
+        for record in records:
+            if bool(record.get("live_pending")):
+                pending_records.append(record)
+                continue
+            status = str(record.get("status", "computed")).strip().lower()
+            has_metric = self._heatmap_record_has_finite_metric(
+                record,
+                metric_name,
+                log_scale=log_scale,
+            )
+            if status in {"missing", "pending", "running", "assigned"}:
+                pending_records.append(record)
+            elif has_metric:
+                computed_records.append(record)
+            else:
+                pending_records.append(record)
+        dot_x, dot_y = self._unvisited_store_dot_centers(records)
+        if dot_x:
+            self.ax_heatmap.scatter(
+                dot_x,
+                dot_y,
+                s=16,
+                marker="o",
+                color="#d62728",
+                linewidths=0,
+                zorder=1,
+            )
         patches = [_heatmap_grid_rectangle(record) for record in computed_records]
         values = np.asarray(
             [float(record["metrics"].get(metric_name, np.nan)) for record in computed_records],
@@ -6091,6 +6878,7 @@ class PychmpViewApp:
                 facecolors=facecolors,
                 edgecolor="none",
                 linewidth=0.0,
+                zorder=2,
             )
             metric_mappable = mpl_cm.ScalarMappable(norm=heatmap_norm, cmap=cmap)
             metric_mappable.set_array(np.asarray(color_values, dtype=float))
@@ -6103,6 +6891,7 @@ class PychmpViewApp:
                 edgecolors="#666666",
                 linewidths=1.8,
                 linestyles="dashed",
+                zorder=3,
             )
             self.ax_heatmap.add_collection(pending_collection)
         apply_heatmap_axis_style(self.ax_heatmap, metric_name=metric_name)
@@ -6115,10 +6904,7 @@ class PychmpViewApp:
             b_max=heatmap_b_max,
         )
 
-        locked_active_view = (
-            self._navigation_mode() == "active"
-            and getattr(self, "_refresh_signal_active_point", None) is not None
-        )
+        locked_active_view = self._heatmap_selection_locked()
         best_markers = {"chi2": ("#d62728", "o"), "rho2": ("#1f77b4", "s"), "eta2": ("#2ca02c", "^")}
         for name, (color, marker) in best_markers.items():
             if locked_active_view:
@@ -6158,41 +6944,8 @@ class PychmpViewApp:
                 zorder=6,
             )
 
-        current_b_value: float | None = None
-        current_a_value: float | None = None
-        if self._navigation_mode() == "free":
-            free_ab = self._free_grid_selection_ab()
-            if free_ab is not None:
-                current_a_value, current_b_value = free_ab
-        if current_a_value is None or current_b_value is None:
-            current_a = int(self.a_index_var.get())
-            current_b = int(self.b_index_var.get())
-            current_record = record_lookup.get((current_a, current_b))
-            if current_record is not None:
-                current_b_value = float(current_record["b_center"])
-                current_a_value = float(current_record["a_center"])
-            elif 0 <= int(current_a) < int(self.a_values.size) and 0 <= int(current_b) < int(self.b_values.size):
-                current_b_value = float(self.b_values[current_b])
-                current_a_value = float(self.a_values[current_a])
-        if current_b_value is not None and current_a_value is not None and not locked_active_view:
-            self.ax_heatmap.scatter(
-                [current_a_value],
-                [current_b_value],
-                s=170,
-                marker="x",
-                color="black",
-                linewidth=3.6,
-                zorder=7,
-            )
-            self.ax_heatmap.scatter(
-                [current_a_value],
-                [current_b_value],
-                s=120,
-                marker="x",
-                color="white",
-                linewidth=2.2,
-                zorder=8,
-            )
+        if not locked_active_view:
+            self._draw_heatmap_selection_marker()
         for record in assigned_only_records(self.payload):
             try:
                 assigned_a = float(record["a"])
@@ -6359,18 +7112,29 @@ class PychmpViewApp:
                 selected_trial_index = None
             else:
                 current_index = int(self.trial_index_var.get())
-                token_matches_context = self._trial_token_matches_context(
-                    self._selected_trial_token,
-                    a_token=live_a_token,
-                    b_token=live_b_token,
-                    point_metric=point_metric,
-                )
-                if not token_matches_context or current_index < 0 or current_index >= q0_trials.size:
-                    selected_trial_index = int(np.clip(q0_trials.size - 1, 0, max(0, q0_trials.size - 1)))
-                    self.trial_index_var.set(selected_trial_index)
+                if self._metrics_pointer_locked():
+                    best_index = self._best_trial_index_from_metric(metric_trials)
+                    selected_trial_index = (
+                        int(best_index)
+                        if best_index is not None
+                        else int(np.clip(current_index, 0, max(0, q0_trials.size - 1)))
+                    )
+                    if int(self.trial_index_var.get()) != int(selected_trial_index):
+                        self.trial_index_var.set(int(selected_trial_index))
                     self._selected_trial_token = current_live_token
                 else:
-                    selected_trial_index = current_index
+                    token_matches_context = self._trial_token_matches_context(
+                        self._selected_trial_token,
+                        a_token=live_a_token,
+                        b_token=live_b_token,
+                        point_metric=point_metric,
+                    )
+                    if not token_matches_context or current_index < 0 or current_index >= q0_trials.size:
+                        selected_trial_index = int(np.clip(q0_trials.size - 1, 0, max(0, q0_trials.size - 1)))
+                        self.trial_index_var.set(selected_trial_index)
+                        self._selected_trial_token = current_live_token
+                    else:
+                        selected_trial_index = current_index
             raw_active_trial_index = live_state.get("active_trial_index")
             if raw_active_trial_index is not None:
                 try:
@@ -6416,7 +7180,8 @@ class PychmpViewApp:
             self._apply_figure_autolayout(self.trials_figure)
             self.trials_canvas.draw_idle()
             return
-        if point_status == "pending":
+        has_partial_trials = self._point_has_committed_trial_history(q0_trials, metric_trials)
+        if point_status == "pending" and not has_partial_trials:
             self._refresh_trial_selector_controls(point, np.asarray([], dtype=float), np.asarray([], dtype=float), point_metric)
             show_trials_message(
                 self.ax_trials,
@@ -6598,7 +7363,7 @@ class PychmpViewApp:
             f"Status: {success_text}"
         )
 
-    def _refresh_summary(self) -> None:
+    def _refresh_summary(self, *, include_map_diagnostics: bool = True) -> None:
         live_state = self._live_trial_state()
         if self._should_force_live_trials(live_state):
             self.summary_var.set(self._active_point_waiting_summary(live_state))
@@ -6621,7 +7386,12 @@ class PychmpViewApp:
                 )
             )
             return
-        point = self._selected_point()
+        if self._navigation_mode() == "free":
+            point = self._point_payload_for_selection()
+            if point is None:
+                point = self._selected_point()
+        else:
+            point = self._selected_point()
         diagnostics = self._selected_diagnostics()
         q0_trials, metric_trials, point_metric = self._trial_series_for_point(point)
         selected_trial_index = self._selected_trial_index_for_point(point, q0_trials, metric_trials, point_metric)
@@ -6683,12 +7453,23 @@ class PychmpViewApp:
         if np.isfinite(elapsed_value):
             lines[3] = f"{lines[3]} in {elapsed_value:.3f} s"
             lines.append(f"elapsed = {elapsed_value:.3f} s")
-        metrics_mask_text = self._metrics_mask_summary(diagnostics)
+        metrics_mask_text = self._metrics_mask_summary(
+            self._apply_search_recipe_fields_to_display_diagnostics(diagnostics)
+        )
         if metrics_mask_text:
             lines.append(f"metrics_mask = {metrics_mask_text}")
-            mask_pixels_text = self._metrics_mask_pixel_summary(point, diagnostics)
-            if mask_pixels_text:
-                lines.append(f"metrics_mask_pixels = {mask_pixels_text}")
+            if include_map_diagnostics:
+                mask_pixels_text = self._metrics_mask_pixel_summary(
+                    point,
+                    self._apply_search_recipe_fields_to_display_diagnostics(diagnostics),
+                )
+                if mask_pixels_text:
+                    lines.append(f"metrics_mask_pixels = {mask_pixels_text}")
+        mask_warning = resolve_metrics_mask_inconsistency_warning(
+            self._apply_search_recipe_fields_to_display_diagnostics(diagnostics)
+        )
+        if mask_warning:
+            lines.append(f"metrics_mask_warning = {mask_warning}")
         tr_mask_text = self._tr_mask_summary(diagnostics)
         if tr_mask_text:
             lines.append(f"tr_mask = {tr_mask_text}")
@@ -6699,7 +7480,7 @@ class PychmpViewApp:
         if bracket is not None:
             lines.append(f"adaptive_bracket = {bracket}")
         selected_trials = np.asarray(point.get(f"fit_{self.metric_var.get()}_trials", ()), dtype=float)
-        if self.metric_var.get() != str(self._selected_point().get("target_metric", self.run_target_metric)) and selected_trials.size == 0:
+        if self.metric_var.get() != str(point.get("target_metric", self.run_target_metric)) and selected_trials.size == 0:
             lines.extend(
                 [
                     "",

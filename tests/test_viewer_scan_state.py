@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +69,12 @@ class _AxisStub:
     def plot(self, *_args, **_kwargs) -> None:
         pass
 
+    def set_xscale(self, *_args, **_kwargs) -> None:
+        pass
+
+    def set_yscale(self, *_args, **_kwargs) -> None:
+        pass
+
     def axvline(self, *_args, **_kwargs) -> None:
         pass
 
@@ -76,6 +83,14 @@ class _AxisStub:
 
     def scatter(self, *_args, **_kwargs) -> None:
         pass
+
+
+class _PlotTrackingAxisStub(_AxisStub):
+    def __init__(self) -> None:
+        self.plot_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def plot(self, *args, **kwargs) -> None:
+        self.plot_calls.append((args, kwargs))
 
 
 class _AxisLimitsStub(_AxisStub):
@@ -170,6 +185,186 @@ def test_adaptive_sparse_complete_phase_reports_finished(tmp_path: Path) -> None
 
     assert badge == "FINISHED"
     assert "Last phase: scan complete" in info_detail
+
+
+def test_in_progress_search_without_live_runner_reports_incomplete(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, phase="", refresh_active=False)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": False,
+            "lifecycle": {"started_at": "2026-06-05T05:19:59Z"},
+            "diagnostics": {"q0_search_stages": ["data"]},
+        },
+        "selected_search_id": "search_live",
+        "a_values": [0.0, 0.3],
+        "b_values": [2.4, 3.0],
+        "points": {
+            (0, 0): {"status": "computed", "a": 0.0, "b": 2.4},
+            (0, 1): {"status": "pending", "a": 0.0, "b": 3.0},
+        },
+    }
+    app.a_values = np.asarray([0.0, 0.3], dtype=float)
+    app.b_values = np.asarray([2.4, 3.0], dtype=float)
+    app._runner_pid_from_log = lambda: None
+
+    assert app._live_runner_detected() is False
+
+    badge, _toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INCOMPLETE"
+    assert "Live runner: no" in info_detail
+
+
+def test_stale_completed_at_before_started_does_not_report_finished(tmp_path: Path) -> None:
+    """Regression: green FINISHED with in_progress + stale completed_at (Sep 21 followup)."""
+
+    app = _make_app(tmp_path, phase="adaptive search failed", refresh_active=False)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": False,
+            "lifecycle": {
+                "started_at": "2026-09-21T13:48:26Z",
+                "completed_at": "2026-09-20T20:10:23Z",
+                "active": False,
+                "in_progress": True,
+            },
+        },
+        "selected_search_id": "search_72b4da2f13369cc9",
+        "selected_slice_key": "euv_94",
+        "selected_slice": {"key": "euv_94", "label": "EUV: 94 A", "domain": "euv"},
+        "a_values": [0.0],
+        "b_values": [2.4],
+        "points": {
+            (0, 0): {"status": "pending", "a": 0.0, "b": 2.4},
+        },
+    }
+    app.a_values = np.asarray([0.0], dtype=float)
+    app.b_values = np.asarray([2.4], dtype=float)
+    app._runner_pid_from_log = lambda: None
+    app._process_is_running = lambda _pid: False
+
+    badge, toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INTERRUPTED"
+    assert badge != "FINISHED"
+    assert "0/1 computed" in toolbar_detail
+    assert "Search status: in_progress" in info_detail
+    assert "Search active marker: no" in info_detail
+    assert "Search completed: 2026-09-20T20:10:23Z" in info_detail
+    assert "Last phase: adaptive search failed" in info_detail
+
+
+def test_inactive_marker_alone_does_not_imply_finished(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, phase="", refresh_active=False)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": False,
+            "lifecycle": {
+                "started_at": "2026-09-21T13:48:26Z",
+                "active": False,
+                "in_progress": True,
+            },
+        },
+        "selected_search_id": "search_incomplete",
+        "points": {
+            (0, 0): {"status": "pending", "a": 0.3, "b": 2.7},
+        },
+    }
+    app._runner_pid_from_log = lambda: None
+
+    badge, _toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INCOMPLETE"
+    assert "Search active marker: no" in info_detail
+
+
+def test_badge_reports_running_while_runner_pid_alive(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, phase="point 1 saved", refresh_active=False)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": True,
+            "lifecycle": {"active": True, "in_progress": True, "started_at": "2026-10-02T12:00:00Z"},
+        },
+        "selected_search_id": "search_live",
+        "selected_slice_key": "mw_2p873584ghz",
+        "points": {
+            (0, 0): {"status": "pending", "a": 0.3, "b": 2.7},
+        },
+    }
+    app._refresh_signal_slice_key = "mw_2p873584ghz"
+    app._refresh_signal_search_id = "search_live"
+    app._runner_pid_from_log = lambda: 4242
+    app._process_is_running = lambda _pid: True
+
+    badge, _toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "RUNNING"
+    assert "Live runner: yes" in info_detail
+
+
+def test_process_is_running_treats_eperm_as_alive(tmp_path: Path) -> None:
+    """PermissionError / EPERM from os.kill(pid, 0) means the process exists."""
+
+    import errno
+    import os
+
+    app = object.__new__(PychmpViewApp)
+
+    def _raise_eperm(_pid: int, _sig: int) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    original_kill = os.kill
+    os.kill = _raise_eperm  # type: ignore[assignment]
+    try:
+        assert app._process_is_running(4242) is True
+    finally:
+        os.kill = original_kill  # type: ignore[assignment]
+
+    def _raise_esrch(_pid: int, _sig: int) -> None:
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    os.kill = _raise_esrch  # type: ignore[assignment]
+    try:
+        assert app._process_is_running(4242) is False
+    finally:
+        os.kill = original_kill  # type: ignore[assignment]
+
+
+def test_badge_reports_incomplete_after_runner_pid_gone_despite_fresh_heartbeat(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, phase="point 1 saved", refresh_active=True)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": True,
+            "lifecycle": {"active": True, "in_progress": True, "started_at": "2026-10-02T12:00:00Z"},
+        },
+        "selected_search_id": "search_dead",
+        "selected_slice_key": "mw_2p873584ghz",
+        "points": {
+            (0, 0): {"status": "pending", "a": 0.3, "b": 2.7},
+        },
+    }
+    app._refresh_signal_slice_key = "mw_2p873584ghz"
+    app._refresh_signal_search_id = "search_dead"
+    app._refresh_signal_active_point = (0.3, 2.7)
+    app._runner_pid_from_log = lambda: 4242
+    app._process_is_running = lambda _pid: False
+
+    assert app._live_runner_detected() is False
+
+    badge, _toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INCOMPLETE"
+    assert "Live runner: no" in info_detail
 
 
 def test_fresh_scan_complete_refresh_does_not_report_running(tmp_path: Path) -> None:
@@ -480,6 +675,8 @@ def test_sync_live_trial_state_populates_live_state_from_artifact() -> None:
     viewer_module.load_grid_point_live_state = lambda *_args, **_kwargs: {
         "slice_key": "euv_193",
         "search_id": "search_b",
+        "point_id": "p000000",
+        "grid_point_status": "RUNNING",
         "a": 0.3,
         "b": 2.7,
         "metric_name": "eta2",
@@ -488,6 +685,7 @@ def test_sync_live_trial_state_populates_live_state_from_artifact() -> None:
         "fit_shift_x_trials": np.asarray([1.25, -0.5, 0.0], dtype=float),
         "fit_shift_y_trials": np.asarray([-0.75, 2.0, 0.0], dtype=float),
         "fit_find_shift_valid_trials": np.asarray([True, True, False], dtype=bool),
+        "fit_trial_mask_stages": ["data", "data", ""],
         "q0": 1.0e-2,
         "trial_index": 3,
     }
@@ -501,6 +699,8 @@ def test_sync_live_trial_state_populates_live_state_from_artifact() -> None:
     assert merged["active_trial_index"] == 3
     np.testing.assert_allclose(np.asarray(merged["fit_shift_x_trials"], dtype=float), [1.25, -0.5, 0.0])
     np.testing.assert_allclose(np.asarray(merged["fit_shift_y_trials"], dtype=float), [-0.75, 2.0, 0.0])
+    assert merged["grid_point_status"] == "RUNNING"
+    assert merged["fit_trial_mask_stages"] == ["data", "data", ""]
 
 
 def test_live_search_matches_when_heartbeat_search_id_is_null() -> None:
@@ -713,8 +913,10 @@ def test_poll_external_refresh_signal_uses_lightweight_refresh_for_trial_phase(t
     assert calls["refresh"] == 0
 
 
-def test_scan_state_reports_interrupted_for_empty_search_with_stale_live_state(tmp_path: Path) -> None:
-    app = _make_app(tmp_path, phase="trial 06 active", refresh_active=False)
+def test_scan_state_reports_incomplete_for_empty_search_with_stale_live_state(tmp_path: Path) -> None:
+    """Empty grid + dead PID + leftover active/heartbeat → INCOMPLETE (not INTERRUPTED)."""
+
+    app = _make_app(tmp_path, phase="trial 06 active", refresh_active=True)
     app.payload = {
         "points": {},
         "selected_slice_key": "mw_2p873584ghz",
@@ -723,7 +925,12 @@ def test_scan_state_reports_interrupted_for_empty_search_with_stale_live_state(t
         "selected_search": {
             "status": "empty",
             "active": True,
-            "lifecycle": {"active": True, "in_progress": True, "status": "empty"},
+            "lifecycle": {
+                "active": True,
+                "in_progress": True,
+                "status": "empty",
+                "started_at": "2026-10-02T12:00:00Z",
+            },
             "target_metric": "eta2",
         },
         "diagnostics": {
@@ -738,17 +945,57 @@ def test_scan_state_reports_interrupted_for_empty_search_with_stale_live_state(t
         "metric_name": "eta2",
     }
     app._refresh_signal_slice_key = "mw_2p873584ghz"
-    app._live_runner_detected = lambda: False
+    app._refresh_signal_search_id = "search_a4c3736655362921"
+    app._runner_pid_from_log = lambda: 4242
+    app._process_is_running = lambda _pid: False
     app._active_point_scoped_to_selection = lambda: None
+
+    assert app._live_runner_detected() is False
 
     badge, toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
 
-    assert badge == "INTERRUPTED"
+    assert badge == "INCOMPLETE"
     assert toolbar_detail == "MW: 2.874 GHz | search_a4c3736655362921 | 0/0 computed"
     assert "Computed: 0" in info_detail
 
 
+def test_scan_state_reports_interrupted_for_empty_search_after_failed_phase(tmp_path: Path) -> None:
+    """Empty grid still uses INTERRUPTED when phase/status indicates failure."""
+
+    app = _make_app(tmp_path, phase="adaptive search failed", refresh_active=False)
+    app.payload = {
+        "points": {},
+        "selected_slice_key": "mw_2p873584ghz",
+        "selected_slice": {"label": "MW: 2.874 GHz", "key": "mw_2p873584ghz"},
+        "selected_search_id": "search_failed_empty",
+        "selected_search": {
+            "status": "failed",
+            "active": False,
+            "lifecycle": {
+                "active": False,
+                "status": "failed",
+                "started_at": "2026-10-02T12:00:00Z",
+            },
+            "target_metric": "eta2",
+        },
+        "diagnostics": {
+            "artifact_kind": "pychmp_ab_scan_sparse_points",
+            "search_mode": "adaptive_local_single_observation",
+        },
+    }
+    app._runner_pid_from_log = lambda: 4242
+    app._process_is_running = lambda _pid: False
+    app._active_point_scoped_to_selection = lambda: None
+
+    badge, toolbar_detail, _info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INTERRUPTED"
+    assert "0/0 computed" in toolbar_detail
+
+
 def test_scan_state_reports_finished_when_saved_search_complete_even_if_refresh_fresh(tmp_path: Path) -> None:
+    """Authoritative complete wins over a still-alive runner PID (and fresh refresh)."""
+
     app = _make_app(tmp_path, phase="trial 03 complete", refresh_active=True)
     app.payload["selected_search"] = {
         "status": "complete",
@@ -1831,6 +2078,50 @@ def test_apply_locked_navigation_best_follows_slice_local_best() -> None:
     assert app._selected_trial_token is None
 
 
+def test_best_mode_heatmap_pointer_locks_to_best_grid_point() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("best")
+    app.metric_var = _Var("eta2")
+    app.run_target_metric = "eta2"
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+    app.a_values = np.asarray([0.0, 0.3], dtype=float)
+    app.b_values = np.asarray([2.4, 2.7], dtype=float)
+    app.display_model = {"records": []}
+    app._applying_navigation_selection = False
+    app._selected_trial_token = "stale"
+    app._refresh_selector_values = lambda: None
+    app.payload = {
+        "a_values": [0.0, 0.3],
+        "b_values": [2.4, 2.7],
+        "points": {
+            (0, 0): {
+                "status": "computed",
+                "a": 0.0,
+                "b": 2.4,
+                "metrics": {"eta2": 9.0},
+                "diagnostics": {"eta2": 9.0},
+            },
+            (1, 1): {
+                "status": "computed",
+                "a": 0.3,
+                "b": 2.7,
+                "metrics": {"eta2": 0.2},
+                "diagnostics": {"eta2": 0.2},
+            },
+        },
+    }
+    app._best_navigation_available = lambda: True
+    app._active_navigation_mode_available = lambda: False
+
+    app._apply_locked_navigation_selection(schedule_slice_reload=False)
+
+    assert app._heatmap_selection_marker_coords() == (
+        pytest.approx(0.3),
+        pytest.approx(2.7),
+    )
+
+
 def test_on_navigation_mode_changed_selects_live_coordinates() -> None:
     app = object.__new__(PychmpViewApp)
     app.navigation_mode_var = _Var("active")
@@ -1887,14 +2178,14 @@ def test_free_mode_allows_active_star_heatmap_click() -> None:
     calls: list[str] = []
     app._refresh_selector_values = lambda: calls.append("selectors")
     app._refresh_action_states = lambda: calls.append("actions")
-    app._refresh_all = lambda: calls.append("refresh")
+    app._refresh_free_selection_views = lambda: calls.append("selection_refresh")
 
     app._on_canvas_click(_EventStub(inaxes=app.ax_heatmap, xdata=0.9, ydata=3.0))
 
     assert app.a_index_var.get() == 3
     assert app.b_index_var.get() == 2
     assert app._selected_trial_token is None
-    assert calls == ["selectors", "actions", "refresh"]
+    assert calls == ["selectors", "actions", "selection_refresh"]
 
 
 def test_free_mode_selects_clicked_coordinates_without_patch_record() -> None:
@@ -1926,7 +2217,7 @@ def test_free_mode_selects_clicked_coordinates_without_patch_record() -> None:
     calls: list[str] = []
     app._refresh_selector_values = lambda: calls.append("selectors")
     app._refresh_action_states = lambda: calls.append("actions")
-    app._refresh_all = lambda: calls.append("refresh")
+    app._refresh_free_selection_views = lambda: calls.append("selection_refresh")
 
     app._on_canvas_click(_EventStub(inaxes=app.ax_heatmap, xdata=0.6, ydata=2.7))
 
@@ -1934,7 +2225,7 @@ def test_free_mode_selects_clicked_coordinates_without_patch_record() -> None:
     assert app.a_index_var.get() == 2
     assert app.b_index_var.get() == 1
     assert app._selected_trial_token is None
-    assert calls == ["selectors", "actions", "refresh"]
+    assert calls == ["selectors", "actions", "selection_refresh"]
 
 
 def test_free_mode_selects_off_grid_click_coordinates() -> None:
@@ -1967,14 +2258,14 @@ def test_free_mode_selects_off_grid_click_coordinates() -> None:
     calls: list[str] = []
     app._refresh_selector_values = lambda: calls.append("selectors")
     app._refresh_action_states = lambda: calls.append("actions")
-    app._refresh_all = lambda: calls.append("refresh")
+    app._refresh_free_selection_views = lambda: calls.append("selection_refresh")
 
     app._on_canvas_click(_EventStub(inaxes=app.ax_heatmap, xdata=0.9, ydata=3.2))
 
     assert app._free_selection_ab == (0.9, 3.2)
     assert app._free_grid_selection_indices() is None
     assert app._selected_trial_token is None
-    assert calls == ["selectors", "actions", "refresh"]
+    assert calls == ["selectors", "actions", "selection_refresh"]
 
 
 def test_point_indices_for_coordinates_matches_grid_values(tmp_path: Path) -> None:
@@ -2628,6 +2919,63 @@ def test_draw_trials_handles_empty_grid_without_crashing() -> None:
     assert "Selected point:" in app.status_var.get()
 
 
+def test_draw_trials_shows_partial_history_for_running_pending_point() -> None:
+    app = object.__new__(PychmpViewApp)
+    app._live_trial_state = lambda: None
+    app._should_use_live_trials = lambda _live_state: False
+    app._should_force_live_trials = lambda _live_state: False
+    app._has_selected_point = lambda: True
+    app._has_saved_selected_point = lambda: True
+    app._point_payload_for_selection = lambda: {
+        "a": -0.05,
+        "b": 4.0,
+        "status": "pending",
+        "success": False,
+        "q0": 0.072,
+        "fit_q0_trials": np.asarray([0.05, 0.072], dtype=float),
+        "fit_metric_trials": np.asarray([0.35, 0.34], dtype=float),
+        "fit_eta2_trials": np.asarray([0.35, 0.34], dtype=float),
+        "target_metric": "eta2",
+        "diagnostics": {"grid_point_status": "RUNNING"},
+    }
+    app._trial_series_for_point = lambda point: (
+        np.asarray(point["fit_q0_trials"], dtype=float),
+        np.asarray(point["fit_metric_trials"], dtype=float),
+        "eta2",
+    )
+    app._selected_trial_index_for_point = lambda *_args, **_kwargs: 1
+    app._refresh_trial_selector_controls = lambda *_args, **_kwargs: None
+    app._annotate_display_metric_best_trial = lambda *_args, **_kwargs: None
+    app._capture_current_slice_view_state = lambda *_args, **_kwargs: None
+    app._slice_label = lambda _descriptor: "MW: 1.418 GHz"
+    app.metric_var = _Var("eta2")
+    app.run_target_metric = "eta2"
+    app.trials_xscale_var = _Var("linear scale")
+    app.trials_yscale_var = _Var("linear scale")
+    app.trial_index_var = _Var(1)
+    app._selected_trial_token = None
+    app.ax_trials = _PlotTrackingAxisStub()
+    app.trials_figure = _FigureStub()
+    app.trials_canvas = type("_Canvas", (), {"draw_idle": lambda self: None})()
+    app._apply_trials_layout_margins = lambda: None
+    app._apply_figure_autolayout = lambda _figure: None
+    app._apply_trials_axis_controls = lambda **_kwargs: None
+    app._sync_trials_axis_controls_from_axes = lambda: None
+    app.navigation_mode_var = _Var("free")
+    app.status_var = _Var("")
+    app.payload = {"selected_slice": {"display_label": "MW: 1.418 GHz"}}
+    app.a_values = np.asarray([-0.05], dtype=float)
+    app.b_values = np.asarray([4.0], dtype=float)
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+
+    app._draw_trials()
+
+    assert app.ax_trials.plot_calls
+    assert "No data yet" not in app.status_var.get()
+    assert "pending" in app.status_var.get()
+
+
 def test_draw_trials_uses_unsaved_live_active_point_status_when_same_slice_selected() -> None:
     app = object.__new__(PychmpViewApp)
     app.navigation_mode_var = _Var("active")
@@ -2693,6 +3041,70 @@ def test_draw_trials_uses_unsaved_live_active_point_status_when_same_slice_selec
     app._draw_trials()
 
     assert "Active point: a=0.600, b=2.700" in app.status_var.get()
+
+
+def test_active_mode_red_pointer_follows_best_trial_not_the_first_q0() -> None:
+    class _VlineAxis(_AxisStub):
+        def __init__(self) -> None:
+            self.vlines: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def axvline(self, *args: object, **kwargs: object) -> None:
+            self.vlines.append((args, kwargs))
+
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("active")
+    app._refresh_signal_active_point = (0.6, 2.7)
+    q0_trials = np.asarray([0.0, 0.0046, 0.01], dtype=float)
+    metric_trials = np.asarray([0.9, 0.15, 0.4], dtype=float)
+    app._live_trial_state = lambda: {
+        "a_index": 0,
+        "b_index": 1,
+        "slice_key": "euv_94",
+        "active_a": 0.6,
+        "active_b": 2.7,
+        "metric_name": "eta2",
+        "q0_trials": q0_trials.tolist(),
+        "metric_trials": metric_trials.tolist(),
+        "active_trial_index": 1,
+        "active_trial_q0": 0.0046,
+    }
+    app._should_use_live_trials = lambda _live_state: False
+    app._should_force_live_trials = lambda _live_state: True
+    app._live_slice_matches_selected = lambda _live_state: True
+    app._live_search_matches_selected = lambda _live_state: True
+    app._live_trial_series_from_state = lambda _live_state: (q0_trials, metric_trials, "eta2", None)
+    app._selection_matches_live_active_point = lambda _a, _b: True
+    app._has_selected_point = lambda: False
+    app.metric_var = _Var("eta2")
+    app.run_target_metric = "eta2"
+    app.trial_index_var = _Var(0)
+    app._selected_trial_token = (0, 1, "eta2", -1)
+    app._refresh_trial_selector_controls = lambda *_args, **_kwargs: None
+    app._apply_trials_axis_controls = lambda **_kwargs: None
+    app._sync_trials_axis_controls_from_axes = lambda: None
+    app._capture_current_slice_view_state = lambda *_args, **_kwargs: None
+    app.trials_xscale_var = _Var("linear scale")
+    app.trials_yscale_var = _Var("linear scale")
+    app.ax_trials = _VlineAxis()
+    app.trials_figure = _FigureStub()
+    app.trials_canvas = type("_Canvas", (), {"draw_idle": lambda self: None})()
+    app._apply_figure_autolayout = lambda _figure: None
+    app.status_var = _Var("")
+    app.payload = {"selected_slice": {"display_label": "EUV 94 Å"}, "selected_slice_key": "euv_94", "points": {}}
+    app.a_values = np.asarray([0.6], dtype=float)
+    app.b_values = np.asarray([2.7], dtype=float)
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+
+    app._draw_trials()
+
+    assert app.trial_index_var.get() == 1
+    red = [call for call in app.ax_trials.vlines if call[1].get("color") == "#d62728"]
+    orange = [call for call in app.ax_trials.vlines if call[1].get("color") == "#f08c00"]
+    assert len(red) == 1
+    assert red[0][0][0] == pytest.approx(0.0046)
+    assert len(orange) == 1
+    assert orange[0][0][0] == pytest.approx(0.0046)
 
 
 def test_sync_trials_axis_controls_displays_current_limits_for_autoscale() -> None:
@@ -2910,39 +3322,12 @@ def test_should_use_live_trials_only_when_selection_matches_active_index() -> No
     assert app._should_use_live_trials({"a_index": 0, "b_index": 2}) is False
 
 
-def test_trial_slider_uses_force_live_mode_for_unsaved_active_point() -> None:
+def test_trial_slider_does_not_move_the_pointer_in_active_mode() -> None:
     app = object.__new__(PychmpViewApp)
     app._updating_trial_slider = False
     app.navigation_mode_var = _Var("active")
-    app._refresh_signal_active_point = (0.9, 3.0)
-    app._has_selected_point = lambda: True
-    app._selected_point = lambda: {
-        "fit_q0_trials": np.asarray([1.0e-5, 1.0e-4]),
-        "fit_metric_trials": np.asarray([1.0, 2.0]),
-        "target_metric": "eta2",
-    }
-    app._trial_series_for_point = lambda _point: (np.asarray([1.0e-5, 1.0e-4]), np.asarray([1.0, 2.0]), "eta2")
-    app._live_trial_state = lambda: {
-        "slice_key": "mw_6p929688ghz",
-        "active_a": 0.9,
-        "active_b": 3.0,
-        "metric_name": "eta2",
-        "q0_trials": [1.0e-6, 1.0e-5, 1.0e-4],
-        "metric_trials": [0.5, 0.6, 0.9],
-    }
-    app._live_trial_series_from_state = lambda _live_state: (
-        np.asarray([1.0e-6, 1.0e-5, 1.0e-4], dtype=float),
-        np.asarray([0.5, 0.6, 0.9], dtype=float),
-        "eta2",
-        None,
-    )
-    app.payload = {"selected_slice_key": "mw_6p929688ghz", "points": {}}
-    app.a_values = np.asarray([0.9], dtype=float)
-    app.b_values = np.asarray([3.0], dtype=float)
     app.trial_index_var = _Var(2)
-    app.run_target_metric = "eta2"
-    app.metric_var = _Var("eta2")
-    app._selected_trial_token = None
+    app._selected_trial_token = (0, 1, "eta2", -1)
     calls = {"refresh": 0}
 
     def _refresh() -> None:
@@ -2952,9 +3337,9 @@ def test_trial_slider_uses_force_live_mode_for_unsaved_active_point() -> None:
 
     app._on_trial_slider_changed("0")
 
-    assert app.trial_index_var.get() == 0
-    assert app._selected_trial_token == (0.9, 3.0, "eta2", -1)
-    assert calls["refresh"] == 1
+    assert app.trial_index_var.get() == 2
+    assert app._selected_trial_token == (0, 1, "eta2", -1)
+    assert calls["refresh"] == 0
 
 
 def test_trial_slider_uses_live_mode_for_saved_active_point() -> None:
@@ -3107,10 +3492,10 @@ def test_trials_canvas_click_uses_live_mode_for_saved_active_point() -> None:
     app._selected_trial_token = None
     calls = {"refresh": 0}
 
-    def _refresh() -> None:
+    def _refresh(**_kwargs: object) -> None:
         calls["refresh"] += 1
 
-    app._refresh_all = _refresh
+    app._refresh_free_selection_views = _refresh
 
     class _Event:
         inaxes = app.ax_trials
@@ -3278,6 +3663,99 @@ def test_selected_trial_index_defaults_to_display_metric_best() -> None:
     assert app.trial_index_var.get() == 1
 
 
+def test_active_and_best_modes_lock_metrics_pointer_to_best_trial() -> None:
+    q0_trials = np.asarray([0.0, 0.0046, 0.01], dtype=float)
+    metric_trials = np.asarray([0.9, 0.15, 0.4], dtype=float)
+    for mode in ("active", "best"):
+        app = object.__new__(PychmpViewApp)
+        app.navigation_mode_var = _Var(mode)
+        app.a_index_var = _Var(1)
+        app.b_index_var = _Var(2)
+        app.trial_index_var = _Var(0)
+        app._selected_trial_token = (1, 2, "eta2", 3)
+        app.run_target_metric = "eta2"
+
+        selected = app._selected_trial_index_for_point({}, q0_trials, metric_trials, "eta2")
+
+        assert selected == 1
+        assert app.trial_index_var.get() == 1
+
+
+def test_free_mode_keeps_a_manual_metrics_pointer() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("free")
+    app.a_index_var = _Var(1)
+    app.b_index_var = _Var(2)
+    app.trial_index_var = _Var(0)
+    app._selected_trial_token = (1, 2, "eta2", 3)
+    app.run_target_metric = "eta2"
+    q0_trials = np.asarray([0.0, 0.0046, 0.01], dtype=float)
+    metric_trials = np.asarray([0.9, 0.15, 0.4], dtype=float)
+
+    selected = app._selected_trial_index_for_point({}, q0_trials, metric_trials, "eta2")
+
+    assert selected == 0
+    assert app.trial_index_var.get() == 0
+
+
+def test_locked_modes_ignore_metrics_pointer_moves() -> None:
+    for mode in ("active", "best"):
+        app = object.__new__(PychmpViewApp)
+        app.navigation_mode_var = _Var(mode)
+        app._updating_trial_slider = False
+        app.trial_index_var = _Var(0)
+        app._selected_trial_token = (1, 2, "eta2", -1)
+        app.ax_trials = object()
+
+        class _Event:
+            inaxes = app.ax_trials
+            xdata = 0.0046
+            ydata = 0.15
+
+        app._on_trial_slider_changed("2")
+        app._jump_to_best_trial()
+        app._on_trials_canvas_click(_Event())
+
+        assert app.trial_index_var.get() == 0
+        assert app._selected_trial_token == (1, 2, "eta2", -1)
+
+
+def test_locked_modes_disable_trial_pointer_controls() -> None:
+    class _Control:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] = {}
+
+        def configure(self, **kwargs: object) -> None:
+            self.kwargs.update(kwargs)
+
+        def set(self, value: object) -> None:
+            self.value = value
+
+    for mode, expected_state in (("free", "normal"), ("active", "disabled"), ("best", "disabled")):
+        app = object.__new__(PychmpViewApp)
+        app.navigation_mode_var = _Var(mode)
+        app._updating_trial_slider = False
+        app.a_index_var = _Var(0)
+        app.b_index_var = _Var(0)
+        app.trial_index_var = _Var(0)
+        app.trial_label_var = _Var("")
+        app.trial_slider = _Control()
+        app.trial_best_button = _Control()
+        q0_trials = np.asarray([0.0, 0.0046], dtype=float)
+        metric_trials = np.asarray([0.9, 0.15], dtype=float)
+
+        app._refresh_trial_selector_controls(
+            None,
+            q0_trials,
+            metric_trials,
+            "eta2",
+            selected_index_override=1,
+        )
+
+        assert app.trial_slider.kwargs["state"] == expected_state
+        assert app.trial_best_button.kwargs["state"] == expected_state
+
+
 def test_slice_change_schedules_deferred_reload() -> None:
     app = object.__new__(PychmpViewApp)
     app.slice_menu = type("_Menu", (), {"current": lambda self: 0})()
@@ -3337,6 +3815,153 @@ def test_refresh_search_controls_prefers_ui_search_over_stale_payload() -> None:
     app._refresh_search_controls()
 
     assert app.search_id_var.get() == "search_new"
+
+
+def test_refresh_slice_controls_prefers_ui_slice_over_stale_payload() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = None
+    app.payload = {"selected_slice_key": "mw_1p418335ghz"}
+    app.available_slices = [
+        {"key": "mw_1p418335ghz", "label": "MW: 1.418 GHz", "domain": "mw"},
+        {"key": "euv_171", "label": "EUV: 171 A", "domain": "euv"},
+    ]
+    app.slice_key_var = _Var("euv_171")
+    app.slice_display_var = _Var("")
+    app.slice_menu = type(
+        "_Menu",
+        (),
+        {
+            "configure": lambda *a, **k: None,
+            "current": lambda self, index=0: None,
+            "grid": lambda *a, **k: None,
+            "grid_remove": lambda *a, **k: None,
+        },
+    )()
+    app.slice_display_label = None
+    app._slice_label = PychmpViewApp._slice_label.__get__(app, PychmpViewApp)
+    app._unique_menu_labels = lambda labels, keys: labels
+    app._selected_slice_key = lambda: str(app.slice_key_var.get())
+
+    app._refresh_slice_controls()
+
+    assert app.slice_key_var.get() == "euv_171"
+
+
+def test_process_refresh_event_does_not_hijack_slice_in_free_mode() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = Path("/tmp/adaptive.h5")
+    app.navigation_mode_var = _Var("free")
+    app._navigation_mode_user_chosen = True
+    app._navigation_mode = lambda: "free"
+    app._live_runner_detected = lambda: True
+    app.payload = {"selected_slice_key": "euv_171", "a_values": [0.0], "b_values": [2.0], "points": {}}
+    app.slice_key_var = _Var("euv_171")
+    app.search_id_var = _Var("search_old")
+    app.a_values = np.asarray([0.0], dtype=float)
+    app.b_values = np.asarray([2.0], dtype=float)
+    app._apply_refresh_signal_payload = lambda _payload: None
+    app._refresh_slice_grid_metadata = lambda: True
+    app._apply_navigation_from_refresh = lambda _payload: None
+    app._sync_live_trial_state_from_artifact = lambda **_kwargs: None
+    app._refresh_selector_values = lambda: None
+    app._refresh_scan_state_display = lambda: None
+    app._refresh_action_states = lambda: None
+    app._schedule_refresh_all = lambda **_kwargs: None
+
+    app._process_refresh_event(
+        {
+            "event": "trial_committed",
+            "slice_key": "mw_1p418335ghz",
+            "search_id": "search_live",
+            "version": 2,
+        }
+    )
+
+    assert app.navigation_mode_var.get() == "free"
+    assert app.slice_key_var.get() == "euv_171"
+    assert app.search_id_var.get() == "search_old"
+
+
+def test_refresh_free_selection_views_skips_heatmap_and_scan_state() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.payload = {
+        "points": {
+            (0, 0): {
+                "status": "computed",
+                "a": 0.3,
+                "b": 2.7,
+                "q0": 1.0e-5,
+                "target_metric": "eta2",
+                "fit_q0_trials": [1.0e-5, 2.0e-5],
+                "fit_eta2_trials": [0.8, 0.7],
+                "diagnostics": {"eta2": 0.7},
+            }
+        },
+        "selected_slice_key": "mw_1p418335ghz",
+        "selected_slice": {"label": "MW: 1.418 GHz"},
+        "diagnostics": {},
+        "a_values": [0.3],
+        "b_values": [2.7],
+    }
+    app.a_values = np.asarray([0.3], dtype=float)
+    app.b_values = np.asarray([2.7], dtype=float)
+    app.navigation_mode_var = _Var("free")
+    app._navigation_mode = lambda: "free"
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+    app._free_selection_ab = (0.3, 2.7)
+    app.metric_var = _Var("eta2")
+    app.run_target_metric = "eta2"
+    app.summary_var = _Var("")
+
+    class _CanvasStub:
+        def draw_idle(self) -> None:
+            return None
+
+    app.trials_canvas = _CanvasStub()
+
+    calls = {"heatmap": 0, "scan_state": 0, "trials": 0, "summary": 0, "marker": 0}
+    app._draw_heatmap = lambda: calls.__setitem__("heatmap", calls["heatmap"] + 1)
+    app._refresh_scan_state_display = lambda: calls.__setitem__("scan_state", calls["scan_state"] + 1)
+    app._draw_trials = lambda: calls.__setitem__("trials", calls["trials"] + 1)
+    app._refresh_summary = lambda **_kwargs: calls.__setitem__("summary", calls["summary"] + 1)
+    app._update_heatmap_selection_marker = lambda: calls.__setitem__("marker", calls["marker"] + 1)
+
+    app._refresh_free_selection_views()
+
+    assert calls == {"heatmap": 0, "scan_state": 0, "trials": 1, "summary": 1, "marker": 1}
+
+
+def test_trial_committed_refresh_uses_lightweight_path_without_grid_reload() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = Path("/tmp/adaptive.h5")
+    app.navigation_mode_var = _Var("active")
+    app._navigation_mode = lambda: "active"
+    app._live_runner_detected = lambda: True
+    app.payload = {"selected_slice_key": "mw_1p418335ghz", "a_values": [0.0], "b_values": [2.0], "points": {}}
+    app.slice_key_var = _Var("mw_1p418335ghz")
+    app.search_id_var = _Var("search_live")
+    app._apply_refresh_signal_payload = lambda _payload: None
+
+    calls = {"grid_reload": 0, "lightweight": 0, "schedule_refresh": 0}
+    app._schedule_slice_grid_metadata_refresh = lambda _payload: calls.__setitem__("grid_reload", calls["grid_reload"] + 1)
+    app._finish_lightweight_refresh_event = lambda _payload: calls.__setitem__("lightweight", calls["lightweight"] + 1)
+    app._schedule_refresh_all = lambda **_kwargs: calls.__setitem__("schedule_refresh", calls["schedule_refresh"] + 1)
+
+    app._process_refresh_event(
+        {
+            "event": "trial_committed",
+            "slice_key": "mw_1p418335ghz",
+            "search_id": "search_live",
+            "point_id": "p000001",
+            "trial_index": 3,
+            "version": 2,
+        }
+    )
+
+    assert calls["grid_reload"] == 0
+    assert calls["lightweight"] == 1
+    assert calls["schedule_refresh"] == 0
 
 
 def test_refresh_all_schedules_reload_when_payload_search_is_stale() -> None:
@@ -3854,3 +4479,347 @@ def test_refresh_all_draws_heatmap_when_search_completed_without_live_point() ->
     assert drawn["heatmap"] == 1
     assert drawn["trials"] == 1
     assert "Waiting for first completed" not in app.status_var.get()
+
+
+def test_background_load_discards_old_selection_and_runs_latest(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    callbacks = []
+    applied = []
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = tmp_path / 'scan.h5'
+    app._is_closing = False
+    app._payload_reload_in_progress = False
+    app._payload_reload_token = 0
+    app._deferred_scan_load_request = None
+    app.slice_key_var = _Var('euv_193')
+    app.search_id_var = _Var('active_search')
+    app.payload = {}
+    app.root = SimpleNamespace(after=lambda delay, callback: callbacks.append(callback))
+    app._load_scan_file_blocking = lambda path, **kw: dict(kw)
+    class InlineThread:
+        def __init__(self, target, **kw): self.target = target
+        def start(self): self.target()
+    monkeypatch.setattr(viewer_mod.threading, 'Thread', InlineThread)
+    app._schedule_background_scan_load(slice_key='euv_193', search_id='active_search', on_success=applied.append)
+    app.slice_key_var.set('euv_171')
+    app.search_id_var.set('chosen_search')
+    app._schedule_background_scan_load(slice_key='euv_171', search_id='chosen_search', on_success=applied.append)
+    callbacks.pop(0)()
+    assert applied == []
+    callbacks.pop(0)()
+    assert applied == [{'slice_key': 'euv_171', 'search_id': 'chosen_search'}]
+    assert not app._payload_reload_in_progress
+
+
+def test_metadata_refresh_preserves_free_coordinate_when_grid_grows() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var('free')
+    app.a_values = np.array([0., 1.])
+    app.b_values = np.array([0.])
+    app.a_index_var = _Var(1)
+    app.b_index_var = _Var(0)
+    app._free_selection_ab = (1., 0.)
+    app._payload_cache_by_selection = {}
+    app._refresh_shared_heatmap_extents = lambda: None
+    app._pin_slice_psf_kernel = lambda: None
+    app.payload = {'a_values': app.a_values, 'b_values': app.b_values, 'points': {}}
+    payload = {'a_values': [-1., 0., 1.], 'b_values': [0.], 'points': {},
+               'selected_slice_key': 'euv_171', 'selected_search_id': 'chosen'}
+    app._apply_slice_grid_metadata_from_payload(payload, requested_slice_key='euv_171', requested_search_id='chosen')
+    assert app._free_selection_ab == (1., 0.)
+    assert (app.a_index_var.get(), app.b_index_var.get()) == (2, 0)
+
+
+@pytest.mark.parametrize('log_scale', [False, True])
+@pytest.mark.parametrize('completed', [True, False])
+def test_heatmap_pending_outlier_does_not_set_color_limits(monkeypatch, log_scale, completed) -> None:
+    from matplotlib.figure import Figure
+    from matplotlib.collections import PatchCollection
+
+    app = object.__new__(PychmpViewApp)
+    app.payload = {'point_records': []}
+    records = []
+    for i, value in enumerate([.44, .9, 50.]):
+        records.append({'a': float(i), 'b': 0., 'a_center': float(i), 'b_center': 0.,
+                        'a_index': i, 'b_index': 0, 'a0': i-.5, 'a1': i+.5, 'b0': -.5, 'b1': .5,
+                        'metrics': {'eta2': value}, 'status': 'computed' if completed and i<2 else 'pending'})
+    app.display_model = {'records': records}
+    app.heatmap_figure = Figure()
+    app.ax_heatmap = app.heatmap_figure.add_subplot(121)
+    app.ax_heatmap_cbar = app.heatmap_figure.add_subplot(122)
+    app._reset_heatmap_colorbar = lambda: None
+    app._ensure_heatmap_colorbar_axes = lambda: None
+    app._heatmap_display_metric = lambda: 'eta2'
+    app._heatmap_display_model = lambda: app.display_model
+    app._use_heatmap_log_scale = lambda: log_scale
+    app._heatmap_plot_limits = lambda model: (-.5, 2.5, -.5, .5)
+    app._heatmap_selection_locked = lambda: True
+    app._navigation_mode = lambda: 'active'
+    app._refresh_signal_active_point = None
+    app._refresh_signal_pending_points = []
+    app._draw_heatmap()
+    if completed:
+        assert app._heatmap_colorbar.norm.vmin == pytest.approx(.44)
+        assert app._heatmap_colorbar.norm.vmax == pytest.approx(.9)
+        colored = app.ax_heatmap.collections[0]
+        assert isinstance(colored, PatchCollection)
+        assert len(colored.get_paths()) == 2
+    else:
+        assert app._heatmap_colorbar is None
+
+
+def test_unvisited_store_dots_pref_defaults_off(monkeypatch) -> None:
+    monkeypatch.setattr(viewer_mod, "_read_viewer_state", lambda: {})
+    assert viewer_mod._load_unvisited_store_dots_pref() is False
+    monkeypatch.setattr(viewer_mod, "_read_viewer_state", lambda: {"unvisited_store_dots": True})
+    assert viewer_mod._load_unvisited_store_dots_pref() is True
+    monkeypatch.setattr(viewer_mod, "_read_viewer_state", lambda: {"unvisited_store_dots": "yes"})
+    assert viewer_mod._load_unvisited_store_dots_pref() is False
+
+
+def _heatmap_app_for_store_dots() -> PychmpViewApp:
+    from matplotlib.figure import Figure
+
+    app = object.__new__(PychmpViewApp)
+    records = [
+        {
+            "a": 0.0,
+            "b": 0.0,
+            "a_center": 0.0,
+            "b_center": 0.0,
+            "a_index": 0,
+            "b_index": 0,
+            "a0": -0.5,
+            "a1": 0.5,
+            "b0": -0.5,
+            "b1": 0.5,
+            "metrics": {"eta2": 0.4},
+            "status": "computed",
+        },
+        {
+            "a": 1.0,
+            "b": 0.0,
+            "a_center": 1.0,
+            "b_center": 0.0,
+            "a_index": 1,
+            "b_index": 0,
+            "a0": 0.5,
+            "a1": 1.5,
+            "b0": -0.5,
+            "b1": 0.5,
+            "metrics": {"eta2": 0.9},
+            "status": "pending",
+        },
+    ]
+    app.payload = {"point_records": [], "selected_slice_key": "euv_193"}
+    app.display_model = {"records": records}
+    app.a_values = np.asarray([0.0, 1.0], dtype=float)
+    app.b_values = np.asarray([0.0, 1.0], dtype=float)
+    app.artifact_h5 = Path("/tmp/unused-store-dots.h5")
+    app.slice_key_var = _Var("euv_193")
+    app.metric_var = _Var("eta2")
+    app.heatmap_figure = Figure()
+    app.ax_heatmap = app.heatmap_figure.add_subplot(121)
+    app.ax_heatmap_cbar = app.heatmap_figure.add_subplot(122)
+    app._heatmap_colorbar = None
+    app._reset_heatmap_colorbar = lambda: None
+    app._ensure_heatmap_colorbar_axes = lambda: None
+    app._heatmap_display_metric = lambda: "eta2"
+    app._heatmap_display_model = lambda: app.display_model
+    app._use_heatmap_log_scale = lambda: False
+    app._heatmap_plot_limits = lambda _model: (-0.5, 1.5, -0.5, 1.5)
+    app._heatmap_selection_locked = lambda: True
+    app._navigation_mode = lambda: "free"
+    app._best_tied_records = []
+    app._refresh_signal_active_point = None
+    app._refresh_signal_pending_points = []
+    return app
+
+
+def test_unvisited_store_dots_stay_off_without_reading_the_slice_index(monkeypatch) -> None:
+    from matplotlib.collections import PatchCollection, PathCollection
+
+    app = _heatmap_app_for_store_dots()
+    app.unvisited_store_dots_var = _Var(False)
+    queries: list[str] = []
+
+    def _forbidden(*_args, **_kwargs):
+        queries.append("slice_index")
+        raise AssertionError("slice index queried while Stored maps is off")
+
+    monkeypatch.setattr(viewer_mod, "slice_index_ab_snapshot", _forbidden)
+    app._draw_heatmap()
+    assert queries == []
+    colored = [item for item in app.ax_heatmap.collections if isinstance(item, PatchCollection)]
+    assert len(colored[0].get_paths()) == 1
+    assert not any(isinstance(item, PathCollection) for item in app.ax_heatmap.collections)
+
+
+def _stored_dot_offsets(app: PychmpViewApp) -> np.ndarray:
+    from matplotlib.collections import PathCollection
+
+    dots = [item for item in app.ax_heatmap.collections if isinstance(item, PathCollection)]
+    assert len(dots) == 1
+    return np.asarray(dots[0].get_offsets(), dtype=float)
+
+
+def test_stored_map_dots_match_across_wavelengths_from_one_index_read(monkeypatch) -> None:
+    from matplotlib.collections import PatchCollection, PathCollection
+
+    app = _heatmap_app_for_store_dots()
+    app.unvisited_store_dots_var = _Var(True)
+    queries: list[int] = []
+
+    def _indexed(_path, slice_key="", after_row=0):
+        del slice_key
+        queries.append(int(after_row))
+        return {(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)}, 8
+
+    monkeypatch.setattr(viewer_mod, "slice_index_ab_snapshot", _indexed)
+    app.slice_key_var = _Var("euv_193")
+    app._draw_heatmap()
+    first = _stored_dot_offsets(app)
+    app.slice_key_var = _Var("euv_131")
+    app._last_payload_reload_at_s = 5.0
+    app._draw_heatmap()
+    second = _stored_dot_offsets(app)
+    assert queries == [0]
+    assert first.shape == (3, 2)
+    assert np.allclose(first, second)
+    assert np.allclose(first, np.asarray([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0]]))
+    collections = list(app.ax_heatmap.collections)
+    dots = next(item for item in collections if isinstance(item, PathCollection))
+    colored = next(item for item in collections if isinstance(item, PatchCollection))
+    assert collections.index(dots) < collections.index(colored)
+    assert dots.get_zorder() < colored.get_zorder()
+    assert float(dots.get_sizes()[0]) == pytest.approx(16)
+    face = dots.get_facecolor()
+    assert face[0, 0] == pytest.approx(214 / 255)
+    assert face[0, 1] == pytest.approx(39 / 255)
+    assert face[0, 2] == pytest.approx(40 / 255)
+    assert len(colored.get_paths()) == 1
+
+
+def test_unvisited_store_dots_read_off_the_ui_thread(monkeypatch) -> None:
+    import threading
+
+    app = _heatmap_app_for_store_dots()
+    app.unvisited_store_dots_var = _Var(True)
+    queries: list[int] = []
+    painted: list[int] = []
+    reader_threads: list[threading.Thread] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def _indexed(_path, slice_key="", after_row=0):
+        del slice_key
+        queries.append(int(after_row))
+        reader_threads.append(threading.current_thread())
+        started.set()
+        assert release.wait(2.0)
+        return {(0.0, 1.0)}, 4
+
+    class _Root:
+        def __init__(self) -> None:
+            self.callbacks: list = []
+
+        def after(self, _delay: int, callback) -> None:
+            self.callbacks.append(callback)
+
+    app.root = _Root()
+    monkeypatch.setattr(viewer_mod, "slice_index_ab_snapshot", _indexed)
+    app._draw_heatmap()
+    assert started.wait(2.0)
+    assert queries == [0]
+    assert reader_threads[0] is not threading.current_thread()
+    app._draw_heatmap()
+    assert queries == [0]
+    release.set()
+    deadline = time.time() + 2.0
+    while not app.root.callbacks and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(app.root.callbacks) == 1
+    app._draw_heatmap = lambda: painted.append(1)
+    app.root.callbacks[0]()
+    assert painted == [1]
+    app._cached_unvisited_store_tokens(app.artifact_h5, "euv_131")
+    assert queries == [0]
+
+
+def test_stored_map_dots_ignore_stale_apply_after_artifact_switch(monkeypatch) -> None:
+    """Path A finishing after B opens must not paint A's dots."""
+    import threading
+
+    app = _heatmap_app_for_store_dots()
+    app.unvisited_store_dots_var = _Var(True)
+    path_a = str(app.artifact_h5)
+    path_b = "/tmp/other-store-dots.h5"
+    painted: list[str] = []
+    started_a = threading.Event()
+    release_a = threading.Event()
+
+    def _indexed(path, slice_key="", after_row=0):
+        del slice_key, after_row
+        key = str(path)
+        if key == path_a:
+            started_a.set()
+            assert release_a.wait(2.0)
+            return {(9.0, 9.0)}, 1
+        return {(1.0, 2.0)}, 1
+
+    class _Root:
+        def __init__(self) -> None:
+            self.callbacks: list = []
+
+        def after(self, _delay: int, callback) -> None:
+            self.callbacks.append(callback)
+
+    app.root = _Root()
+    monkeypatch.setattr(viewer_mod, "slice_index_ab_snapshot", _indexed)
+
+    # Start async fill for artifact A.
+    assert app._cached_unvisited_store_tokens(Path(path_a)) == set()
+    assert started_a.wait(2.0)
+    assert app._unvisited_store_dot_load_key == path_a
+
+    # Open B: clear cache/load key the same way ``_reload_payload`` does on path switch.
+    app.artifact_h5 = Path(path_b)
+    app._unvisited_store_dot_cache = {}
+    app._unvisited_store_dot_load_key = None
+
+    release_a.set()
+    deadline = time.time() + 2.0
+    while not app.root.callbacks and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(app.root.callbacks) == 1
+
+    app._draw_heatmap = lambda: painted.append(str(app._unvisited_store_dot_cache.get("path")))
+
+    # Stale A apply must drop: no cache write, no redraw of A's dots.
+    app.root.callbacks[0]()
+    assert app._unvisited_store_dot_load_key is None
+    assert app._unvisited_store_dot_cache == {}
+    assert painted == []
+
+    # Fresh B fill still works after the discarded A result.
+    app.root.callbacks.clear()
+    assert app._cached_unvisited_store_tokens(Path(path_b)) == set()
+    deadline = time.time() + 2.0
+    while not app.root.callbacks and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(app.root.callbacks) == 1
+    app.root.callbacks[0]()
+    assert app._unvisited_store_dot_cache.get("path") == path_b
+    assert app._unvisited_store_dot_cache.get("points") == {(1.0, 2.0)}
+    assert painted == [path_b]
+
+
+def test_refresh_controls_does_not_restore_previous_slice_search_while_loading() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.payload = {'selected_slice_key': 'euv_193', 'selected_search_id': 'active'}
+    app.slice_key_var = _Var('euv_171')
+    app.search_id_var = _Var('chosen')
+    app.available_searches = [{'search_id': 'active'}]
+    app._refresh_search_controls()
+    assert app.search_id_var.get() == 'chosen'

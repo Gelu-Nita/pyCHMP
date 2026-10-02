@@ -53,6 +53,7 @@ from .ab_scan_artifacts import (
     _write_reference_map_group,
     _write_search_lifecycle_dataset,
     _write_search_status_attrs,
+    _resolved_psf_kernel_from_common_payload,
     append_scan_point_record,
     decode_scalar,
     target_slice_descriptor_from_diagnostics,
@@ -327,6 +328,14 @@ def _ensure_search_context(
             data=np.asarray(blos_data, dtype=float),
             wcs_header=blos_header,
         )
+    elif ensure_slice_common:
+        from .ab_scan_artifacts import ensure_slice_common_psf_kernel
+
+        ensure_slice_common_psf_kernel(
+            slice_group["common"],
+            psf_kernel=psf_kernel,
+            diagnostics=diagnostics_out,
+        )
     searches_group = slice_group.require_group(SEARCHES_GROUP)
     layout_payload = {"kind": "point_list"}
     request_payload = _search_request_from_diagnostics(diagnostics_out, layout=layout_payload)
@@ -472,6 +481,9 @@ class GridTrialCommittedEvent:
     best_metric: float
     raw_modeled_map: np.ndarray | None = None
     raw_map_ref: str | None = None
+    raw_map_identity: dict[str, Any] | None = None
+    map_store_arrays: dict[str, np.ndarray] | None = None
+    map_store_identities: dict[str, dict[str, Any]] | None = None
     trial_metadata: dict[str, Any] | None = None
     shift_x: float | None = None
     shift_y: float | None = None
@@ -712,13 +724,42 @@ def apply_grid_trial_committed(
                 "q0": float(event.q0),
                 "target_metric": str(header.get("metric_name", "chi2")),
             }
-            map_refs["raw_modeled"] = _write_map_store_array(
-                f,
-                identity=_map_store_identity(
+            raw_identity = (
+                dict(event.raw_map_identity)
+                if event.raw_map_identity is not None
+                else _map_store_identity(
                     name=f"grid_points/{event.point_id}/trials/{trial_name}/raw_modeled",
                     normalized=identity_source,
-                ),
+                )
+            )
+            map_refs["raw_modeled"] = _write_map_store_array(
+                f,
+                identity=raw_identity,
                 data=np.asarray(event.raw_modeled_map, dtype=float),
+            )
+        for map_name, array in dict(event.map_store_arrays or {}).items():
+            normalized_name = str(map_name).strip()
+            if not normalized_name:
+                continue
+            identities = dict(event.map_store_identities or {})
+            map_identity = identities.get(normalized_name)
+            if map_identity is None:
+                identity_source = {
+                    **dict(diagnostics),
+                    "a": float(header["a"]),
+                    "b": float(header["b"]),
+                    "q0": float(event.q0),
+                    "target_metric": str(header.get("metric_name", "chi2")),
+                    "map_store_array": normalized_name,
+                }
+                map_identity = _map_store_identity(
+                    name=f"grid_points/{event.point_id}/trials/{trial_name}/extra/{normalized_name}",
+                    normalized=identity_source,
+                )
+            map_refs[f"extra/{normalized_name}"] = _write_map_store_array(
+                f,
+                identity=dict(map_identity),
+                data=np.asarray(array, dtype=float),
             )
         existing_metadata = (
             _json_loads_or_empty(trial_group["trial_metadata_json"][()])
@@ -1002,8 +1043,13 @@ def _load_grid_point_trials_once(point_group: h5py.Group, *, include_maps: bool)
     trials_group = point_group[GRID_POINTS_TRIALS_GROUP]
     for name in sorted(trials_group.keys()):
         trial = trials_group[name]
-        trial_metadata = _json_loads_or_empty(trial["trial_metadata_json"][()]) if "trial_metadata_json" in trial else {}
-        map_refs = _json_loads_or_empty(trial[MAP_REFS_DATASET][()]) if MAP_REFS_DATASET in trial else {}
+        try:
+            trial_metadata = _json_loads_or_empty(trial["trial_metadata_json"][()]) if "trial_metadata_json" in trial else {}
+            map_refs = _json_loads_or_empty(trial[MAP_REFS_DATASET][()]) if MAP_REFS_DATASET in trial else {}
+        except (OSError, RuntimeError) as exc:
+            if not is_h5_transient_read_error(exc):
+                raise
+            continue
         entry = {
             "trial_index": int(trial.attrs.get("trial_index", 0)),
             "q0": float(trial.attrs["q0"]),
@@ -1209,6 +1255,7 @@ def load_grid_point_trial_plot_payload(
     trial_index: int | None = None,
     slice_key: str | None = None,
     search_id: str | None = None,
+    psf_kernel: np.ndarray | None = None,
 ) -> dict[str, Any] | None:
     with _H5PY_FILE(h5_path, "r") as f:
         group, _descriptors, selected_key = _resolve_slice_group(
@@ -1268,11 +1315,16 @@ def load_grid_point_trial_plot_payload(
             return None
         common_payload = _read_common_group(group["common"])
         observed = np.asarray(common_payload.get("observed"), dtype=float)
-        psf_kernel = common_payload.get("psf_kernel")
+        if psf_kernel is not None:
+            from .psf import _normalized_psf_kernel_array
+
+            resolved_psf_kernel = _normalized_psf_kernel_array(psf_kernel)
+        else:
+            resolved_psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         raw_display, modeled, residual, _has_raw = _derive_display_maps_from_raw(
             raw_modeled,
             observed_template=observed,
-            psf_kernel=psf_kernel,
+            psf_kernel=resolved_psf_kernel,
         )
         if raw_display is None or modeled is None or residual is None:
             return None
@@ -1287,7 +1339,7 @@ def load_grid_point_trial_plot_payload(
             "residual": np.asarray(residual, dtype=float),
             "observed": observed,
             "wcs_header": common_payload["wcs_header"],
-            "psf_kernel": psf_kernel,
+            "psf_kernel": resolved_psf_kernel,
             "selected_slice_key": str(selected_key),
             "selected_search_id": str(selected_search_id),
         }
@@ -1330,7 +1382,7 @@ def hydrate_render_maps_from_grid_point(
             return 0
         common_payload = _read_common_group(slice_group["common"])
         observed = np.asarray(common_payload.get("observed"), dtype=float)
-        psf_kernel = common_payload.get("psf_kernel")
+        psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         for trial in _load_grid_point_trials(point_group, include_maps=False):
             q0_value = float(trial["q0"])
             key = f"{float(q0_value):.17g}"
@@ -1406,6 +1458,8 @@ def load_grid_point_live_state(
             "fit_shift_x_trials": list(record_preview.get("fit_shift_x_trials") or ()),
             "fit_shift_y_trials": list(record_preview.get("fit_shift_y_trials") or ()),
             "fit_find_shift_valid_trials": list(record_preview.get("fit_find_shift_valid_trials") or ()),
+            "fit_trial_mask_stages": list(record_preview.get("fit_trial_mask_stages") or ()),
+            "grid_point_status": str(header.get("status", "")),
             "q0": None if active_trial_q0 is None else float(active_trial_q0),
             "trial_index": None if active_trial_q0 is None else active_trial_index,
         }

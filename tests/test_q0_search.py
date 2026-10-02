@@ -2,7 +2,17 @@ import pytest
 
 from pychmp.metrics import MetricValues
 from pychmp.optimize import Q0OptimizationResult, find_best_q0
-from pychmp.q0_search import merge_q0_stage_results, parse_q0_search_stages, resolve_q0_search_stages
+from pychmp.q0_search import (
+    canonical_q0_search_stages_from_profile,
+    defer_warm_curve_commits,
+    merge_q0_stage_results,
+    parse_q0_search_stages,
+    point_record_trial_stages_match_recipe,
+    resolve_q0_search_stages,
+    resolve_warm_bracket_seed_mask_type,
+    resolve_warm_curve_rescore_mask_type,
+    resolve_warm_rescore_mask_type,
+)
 from pychmp.search_options import parse_xy_shift, resolve_chmp_search_settings, resolve_shift_policy_from_args
 
 
@@ -17,6 +27,67 @@ def test_parse_q0_search_stages_rejects_unknown_stage() -> None:
 
 def test_resolve_q0_search_stages_defaults_to_mask_type() -> None:
     assert resolve_q0_search_stages(q0_search_stages=None, mask_type="union", explicit_mask=None) == ("union",)
+
+
+def test_resolve_warm_bracket_seed_mask_type_uses_first_stage() -> None:
+    assert (
+        resolve_warm_bracket_seed_mask_type(
+            q0_search_stages=("data", "union"),
+            mask_type="union",
+            explicit_mask=None,
+        )
+        == "data"
+    )
+    assert (
+        resolve_warm_rescore_mask_type(
+            q0_search_stages=("data",),
+            mask_type="union",
+            explicit_mask=None,
+        )
+        == "data"
+    )
+
+
+def test_defer_warm_curve_commits_for_two_stage_only() -> None:
+    assert defer_warm_curve_commits(q0_search_stages=("data", "union"), mask_type="union") is True
+    assert defer_warm_curve_commits(q0_search_stages=("data",), mask_type="union") is False
+    assert defer_warm_curve_commits(q0_search_stages=("union",), mask_type="union") is False
+
+
+def test_resolve_warm_curve_rescore_mask_type_uses_final_stage() -> None:
+    assert (
+        resolve_warm_curve_rescore_mask_type(
+            q0_search_stages=("data", "union"),
+            mask_type="union",
+            explicit_mask=None,
+        )
+        == "union"
+    )
+    assert (
+        resolve_warm_curve_rescore_mask_type(
+            q0_search_stages=("data",),
+            mask_type="union",
+            explicit_mask=None,
+        )
+        == "data"
+    )
+
+
+def test_canonical_q0_search_stages_prefers_request_over_diagnostics() -> None:
+    profile = {
+        "request": {"q0_search_stages": ["data"]},
+        "diagnostics": {"q0_search_stages": ["union"]},
+    }
+    assert canonical_q0_search_stages_from_profile(profile) == ("data",)
+
+
+def test_point_record_trial_stages_match_recipe_rejects_union_for_data() -> None:
+    record = {"fit_trial_mask_stages": ("union", "union")}
+    assert not point_record_trial_stages_match_recipe(record, q0_search_stages=("data",))
+    assert point_record_trial_stages_match_recipe(
+        {"fit_trial_mask_stages": ("data", "data")},
+        q0_search_stages=("data",),
+    )
 
 
 def test_resolve_q0_search_stages_rejects_two_stage_with_explicit_mask() -> None:
@@ -196,3 +267,15 @@ def test_fit_q0_two_stage_clamps_inter_stage_q0_start(monkeypatch: pytest.Monkey
     )
     assert calls == [("data", None), ("union", pytest.approx(0.001))]
     assert result.q0 == pytest.approx(0.0005)
+
+
+def test_resolved_explicit_recipe_round_trips_through_warm_start():
+    from pychmp.q0_search import normalize_q0_search_stages_value, canonical_q0_search_stages_from_profile
+    stages = resolve_q0_search_stages(q0_search_stages=None, mask_type="explicit_fits", explicit_mask=object())
+    assert normalize_q0_search_stages_value(list(stages)) == ("explicit",)
+    assert canonical_q0_search_stages_from_profile({"request": {"q0_search_stages": list(stages)}}) == stages
+    for resolver in (resolve_warm_bracket_seed_mask_type, resolve_warm_curve_rescore_mask_type):
+        assert resolver(q0_search_stages=stages, mask_type="explicit_fits", explicit_mask=object()) == "explicit_fits"
+    assert not defer_warm_curve_commits(q0_search_stages=stages, mask_type="explicit_fits", explicit_mask=object())
+    with pytest.raises(ValueError):
+        normalize_q0_search_stages_value(["explicit", "union"])

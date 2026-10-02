@@ -17,9 +17,12 @@ from examples.python.adaptive_ab_search_single_observation import (
     _PointRenderStream,
     _PersistentPointCache,
     _StreamingRendererFactory,
+    _decide_viewer_launch,
     _focus_existing_viewer_pid,
     _build_live_point_snapshot_payload,
+    _cocoa_bounds_are_viewer_window,
     _find_existing_viewer_pid,
+    _x11_window_name_matches_artifact,
     _configure_targeted_recompute_search,
     _grid_reset_requested,
     _is_hdf5_lock_contention_error,
@@ -28,6 +31,11 @@ from examples.python.adaptive_ab_search_single_observation import (
     _preload_search_cache_from_artifact,
     _rescore_auxiliary_map_record,
     _resolve_geometry_request_flags,
+    format_uncertified_basin_expand_guidance,
+    _rescore_record_to_warm_initial_evaluations,
+    _warm_bracket_seed_mask_type_from_diagnostics,
+    _warm_curve_rescore_mask_type_from_diagnostics,
+    _warm_rescore_mask_type_from_diagnostics,
     _resolve_observation_request,
     _resolve_render_slice_requests,
 )
@@ -330,6 +338,10 @@ def test_focus_existing_viewer_pid_returns_true_when_osascript_succeeds(monkeypa
         "darwin",
     )
     monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation._activate_cocoa_viewer_pid",
+        lambda _pid: False,
+    )
+    monkeypatch.setattr(
         "examples.python.adaptive_ab_search_single_observation.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0),
     )
@@ -344,6 +356,150 @@ def test_focus_existing_viewer_pid_returns_false_when_not_darwin(monkeypatch: py
     )
 
     assert _focus_existing_viewer_pid(1234) is False
+
+
+def test_focus_existing_viewer_pid_unhides_hidden_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "adaptive.h5"
+    scripts: list[str] = []
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.sys.platform",
+        "darwin",
+    )
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation._activate_cocoa_viewer_pid",
+        lambda _pid: False,
+    )
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation._query_open_viewer_windows",
+        lambda _artifact_h5: (True, [99]),
+    )
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation._raise_open_viewer_windows",
+        lambda _window_ids: True,
+    )
+
+    def _capture_osascript(args, **_kwargs):
+        scripts.append(str(args[2]))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.subprocess.run",
+        _capture_osascript,
+    )
+
+    assert _focus_existing_viewer_pid(1234, artifact_h5=artifact_h5) is True
+    script = "\n".join(scripts)
+    assert 'set visible of targetProc to true' in script
+    assert 'set value of attribute "AXMinimized" of w to false' in script
+    assert 'tell application "XQuartz" to activate' in script
+
+
+def test_x11_window_name_matches_artifact_title(tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "adaptive.h5"
+
+    assert _x11_window_name_matches_artifact(f"pychmp-view: {artifact_h5.name}", artifact_h5) is True
+    assert _x11_window_name_matches_artifact("pychmp-view: other.h5", artifact_h5) is False
+    assert _x11_window_name_matches_artifact("", artifact_h5) is False
+
+
+def test_cocoa_bounds_are_viewer_window_rejects_menu_bar_and_popups() -> None:
+    assert _cocoa_bounds_are_viewer_window(1268, 584, 0) is True
+    assert _cocoa_bounds_are_viewer_window(1470, 33, 0) is False
+    assert _cocoa_bounds_are_viewer_window(186, 121, 0) is False
+    assert _cocoa_bounds_are_viewer_window(1200, 800, 3) is False
+
+
+def test_decide_viewer_launch_reuses_open_window_when_focus_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact_h5 = tmp_path / "adaptive.h5"
+    viewer_script = tmp_path / "pychmp_view.py"
+    module = "examples.python.adaptive_ab_search_single_observation"
+    monkeypatch.setattr(f"{module}._viewer_window_owner_pids", lambda _pids, _artifact_h5: (True, [2222]))
+    monkeypatch.setattr(f"{module}._activate_cocoa_viewer_pid", lambda _pid: False)
+    monkeypatch.setattr(f"{module}._query_open_viewer_windows", lambda _artifact_h5: (True, []))
+    monkeypatch.setattr(
+        f"{module}.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+    )
+
+    decision = _decide_viewer_launch(
+        viewer_script=viewer_script,
+        artifact_h5=artifact_h5,
+        viewer_process=None,
+    )
+
+    assert decision.action == "reuse"
+    assert decision.pid == 2222
+    assert decision.focused is False
+
+
+def test_decide_viewer_launch_starts_when_closed_process_has_no_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact_h5 = tmp_path / "adaptive.h5"
+    viewer_script = tmp_path / "pychmp_view.py"
+    module = "examples.python.adaptive_ab_search_single_observation"
+    monkeypatch.setattr(f"{module}._viewer_window_owner_pids", lambda _pids, _artifact_h5: (True, []))
+    monkeypatch.setattr(f"{module}._find_existing_viewer_pids", lambda **_kwargs: [79951])
+
+    decision = _decide_viewer_launch(
+        viewer_script=viewer_script,
+        artifact_h5=artifact_h5,
+        viewer_process=None,
+    )
+
+    assert decision.action == "launch"
+    assert decision.pid is None
+
+
+def test_decide_viewer_launch_reuses_process_when_display_cannot_be_queried(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact_h5 = tmp_path / "adaptive.h5"
+    viewer_script = tmp_path / "pychmp_view.py"
+    module = "examples.python.adaptive_ab_search_single_observation"
+    monkeypatch.setattr(f"{module}._viewer_window_owner_pids", lambda _pids, _artifact_h5: (False, []))
+    monkeypatch.setattr(f"{module}._find_existing_viewer_pids", lambda **_kwargs: [2222, 3333])
+    monkeypatch.setattr(f"{module}._activate_cocoa_viewer_pid", lambda _pid: False)
+    monkeypatch.setattr(f"{module}._query_open_viewer_windows", lambda _artifact_h5: (False, []))
+    monkeypatch.setattr(f"{module}.sys.platform", "linux")
+
+    decision = _decide_viewer_launch(
+        viewer_script=viewer_script,
+        artifact_h5=artifact_h5,
+        viewer_process=None,
+    )
+
+    assert decision.action == "reuse"
+    assert decision.pid == 3333
+
+
+def test_decide_viewer_launch_keeps_live_child_without_starting_another(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact_h5 = tmp_path / "adaptive.h5"
+    viewer_script = tmp_path / "pychmp_view.py"
+    module = "examples.python.adaptive_ab_search_single_observation"
+    monkeypatch.setattr(f"{module}._query_open_viewer_windows", lambda _artifact_h5: (True, []))
+    monkeypatch.setattr(f"{module}._activate_cocoa_viewer_pid", lambda _pid: True)
+    monkeypatch.setattr(f"{module}.sys.platform", "darwin")
+    viewer_process = SimpleNamespace(pid=77, poll=lambda: None)
+
+    decision = _decide_viewer_launch(
+        viewer_script=viewer_script,
+        artifact_h5=artifact_h5,
+        viewer_process=viewer_process,  # type: ignore[arg-type]
+    )
+
+    assert decision.action == "running"
+    assert decision.pid == 77
+    assert decision.focused is True
 
 
 def test_adaptive_compatibility_signature_tracks_resolved_euv_response_hash() -> None:
@@ -1587,6 +1743,108 @@ def test_persistent_cache_set_pending_points_writes_live_trial_marker(tmp_path: 
     assert int(headers[0]["n_trials"]) == 0
 
 
+def test_assign_grid_points_skips_reset_for_incomplete_running_point(tmp_path: Path) -> None:
+    import h5py
+
+    from pychmp.grid_points import (
+        GRID_POINTS_GROUP,
+        GridPointAssignedEvent,
+        GridPointStatus,
+        GridTrialCommittedEvent,
+        SEARCHES_GROUP,
+        SLICE_CONTAINER_GROUP,
+        apply_grid_point_event_with_retry,
+        read_grid_point_header,
+    )
+
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 1.0
+    header["CDELT2"] = 1.0
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    diagnostics = {
+        "artifact_kind": "unified_ab_scan",
+        "slice_key": "euv_193",
+        "target_slice_key": "euv_193",
+        "target_metric": "eta2",
+        "selected_search_id": "search_b5751ea4cf6c8571",
+        "search_id": "search_b5751ea4cf6c8571",
+    }
+    artifact_h5 = tmp_path / "adaptive.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    point_id = apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridPointAssignedEvent(
+            a=-0.05,
+            b=4.0,
+            q0_start=0.05,
+            next_q0=0.07,
+            metric_name="eta2",
+        ),
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridTrialCommittedEvent(
+            point_id=str(point_id),
+            trial_index=0,
+            q0=0.05,
+            metric=0.36,
+            next_q0=0.07,
+            best_trial_index=0,
+            best_metric=0.36,
+            raw_modeled_map=np.ones((2, 2), dtype=np.float32),
+        ),
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+
+    cache = _PersistentPointCache(
+        artifact_h5=artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        renderer_factory=lambda a_value, b_value: None,
+        target_metric="eta2",
+        psf_source="none",
+        psf_kernel=None,
+        compatibility_signature="sig-123",
+        viewer_heartbeat=None,
+    )
+    cache.set_preserve_stored_search_trials(True)
+    cache.hydrate_from_existing()
+    cache.set_pending_points([(-0.05, 4.0)], q0_starts=[0.08])
+    cache.flush_pending_writes()
+    cache.close()
+
+    with h5py.File(artifact_h5, "r") as f:
+        point_group = f[SLICE_CONTAINER_GROUP]["euv_193"][SEARCHES_GROUP]["search_b5751ea4cf6c8571"][GRID_POINTS_GROUP][point_id]
+        restored = read_grid_point_header(point_group)
+    assert restored["status"] == GridPointStatus.RUNNING.value
+    assert int(restored["n_trials"]) == 1
+    assert float(restored["next_q0"]) == pytest.approx(0.07)
+
+
 def test_dispatcher_advances_live_trial_marker_to_next_pending_point(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1928,3 +2186,238 @@ def test_register_parallel_search_preserves_prior_search(tmp_path: Path) -> None
     assert len(first_search_payload["point_records"]) == 1
     parallel_payload = load_scan_file(artifact_h5, search_id=parallel_search_id)
     assert parallel_payload["point_records"] == []
+
+
+def test_warm_rescore_mask_type_from_diagnostics_uses_data_stage() -> None:
+    diagnostics = {"q0_search_stages": ["data", "union"], "mask_type": "union"}
+    assert (
+        _warm_bracket_seed_mask_type_from_diagnostics(diagnostics, explicit_mask=None)
+        == "data"
+    )
+    assert (
+        _warm_curve_rescore_mask_type_from_diagnostics(diagnostics, explicit_mask=None)
+        == "union"
+    )
+    assert (
+        _warm_rescore_mask_type_from_diagnostics(
+            {"q0_search_stages": ["data"], "mask_type": "union"},
+            explicit_mask=None,
+        )
+        == "data"
+    )
+
+
+def test_rescore_record_to_warm_initial_evaluations_uses_requested_mask_stage() -> None:
+    observed = np.array([[0.0, 2.0], [0.0, 0.0]], dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    trial_map = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=float)
+    record = {
+        "fit_q0_trials": (0.5,),
+        "trial_raw_modeled_maps": np.stack([trial_map], axis=0),
+    }
+    evaluations = _rescore_record_to_warm_initial_evaluations(
+        record,
+        observed=observed,
+        sigma_map=sigma_map,
+        threshold=0.1,
+        explicit_mask=None,
+        target_metric="eta2",
+        mask_type="data",
+    )
+    assert evaluations is not None
+    evaluation = evaluations[0.5]
+    assert evaluation.mask_stage == "data"
+
+
+def test_format_uncertified_basin_expand_guidance_mentions_expand_mode() -> None:
+    message = format_uncertified_basin_expand_guidance(
+        artifact_h5=Path("/tmp/CESRA2026.h5"),
+        search_id="search_2a9954c828524a2c",
+        a_min=-1.0,
+        a_max=3.0,
+        b_min=0.0,
+        b_max=10.0,
+        da=0.25,
+        db=0.25,
+        boundary_axes=("a_min",),
+        frontier_open_axes=(),
+    )
+    assert "--expand-grid-search-id search_2a9954c828524a2c" in message
+    assert "examples/python/adaptive_ab_search_single_observation.py" in message
+    assert "--a-min -1.25" in message
+    assert "Do not re-run a normal adaptive command" in message
+    assert "Resume with wider a/b bounds" not in message
+
+
+def test_resume_preflight_uses_search_recipe_over_auxiliary_placeholder(tmp_path):
+    import h5py
+    import json
+    from examples.python.adaptive_ab_search_single_observation import _load_slice_preflight_payload
+
+    path = tmp_path / "resume.h5"
+    recipe = {"psf_source": "aiapy_psf:131", "resolved_psf": {
+        "source": "aiapy_psf:131", "kind": "kernel", "psf_kernel_shape": [201, 201],
+        "psf_kernel_compacted": True, "psf_kernel_shape_original": [4096, 4096],
+    }}
+    with h5py.File(path, "w") as f:
+        slice_group = f.create_group("slices/euv_131")
+        slice_group.create_dataset("active_search_id", data="saved")
+        common = slice_group.create_group("common")
+        common.create_dataset("wcs_header", data=fits.Header().tostring(sep="\n"))
+        common.create_dataset("diagnostics_json", data=json.dumps({"render_only_slice": True}))
+        search = slice_group.create_group("searches/saved")
+        search.create_dataset("request_json", data=json.dumps(recipe))
+        search.create_dataset("diagnostics_json", data=json.dumps(recipe))
+        ref = search.create_group("observation_ref")
+        ref.create_dataset("observed", data=np.ones((2, 2)))
+        ref.create_dataset("sigma_map", data=np.ones((2, 2)))
+        ref.create_dataset("wcs_header", data=fits.Header().tostring(sep="\n"))
+        ref.create_dataset("diagnostics_json", data="{}")
+    payload = _load_slice_preflight_payload(artifact_h5=path, slice_key="euv_131", include_maps=True)
+    assert payload is not None
+    assert not payload["diagnostics"].get("render_only_slice")
+    assert payload["diagnostics"]["resolved_psf"] == recipe["resolved_psf"]
+    assert payload["diagnostics"]["psf_source"] == recipe["psf_source"]
+    np.testing.assert_array_equal(payload["observed"], np.ones((2, 2)))
+
+
+@pytest.mark.parametrize("change", [None, "bounds", "seed", "running", "pending", "corrupt", "unfinalized"])
+def test_completed_resume_requires_same_walk_and_finished_points(tmp_path, change):
+    import h5py
+    import json
+    from examples.python.adaptive_ab_search_single_observation import _matching_search_is_finished
+    from pychmp.grid_points import GRID_POINT_STORAGE_CORRUPT_ATTR
+
+    path = tmp_path / "complete.h5"
+    diagnostics = dict(search_mode="adaptive_local_single_observation", a_start=0.6,
+                       b_start=1.8, da=0.1, db=0.1, a_range=[-0.2, 2.0], b_range=[0.0, 2.0])
+    lifecycle = dict(status="complete", active=False, completed_at="2026-09-20T22:10:36Z")
+    if change == "running":
+        lifecycle.update(status="in_progress", active=True)
+    if change == "unfinalized":
+        lifecycle["completed_at"] = None
+    with h5py.File(path, "w") as f:
+        search = f.create_group("slices/euv_131/searches/saved")
+        search.create_dataset("diagnostics_json", data=json.dumps(diagnostics))
+        search.create_dataset("lifecycle_json", data=json.dumps(lifecycle))
+        point = search.create_group("grid_points/p000000")
+        point.attrs.update(a=0.6, b=1.8, q0_start=0.001, n_trials=3,
+                           status="RUNNING" if change == "pending" else "COMPLETED")
+        if change == "corrupt":
+            point.attrs[GRID_POINT_STORAGE_CORRUPT_ATTR] = 1
+    if change == "bounds":
+        diagnostics["a_range"] = [-0.3, 2.0]
+    if change == "seed":
+        diagnostics["a_start"] = 0.7
+    assert _matching_search_is_finished(path, slice_key="euv_131", search_id="saved",
+                                       diagnostics=diagnostics) == (change is None)
+
+
+def test_resolve_persisted_euv_response_identity_raises_without_identity_or_adapter() -> None:
+    from examples.python.adaptive_ab_search_single_observation import (
+        _resolve_persisted_euv_response_identity,
+    )
+
+    loaded = SimpleNamespace()  # no response_identity attribute
+    with pytest.raises(RuntimeError, match="no response_identity and no adapter"):
+        _resolve_persisted_euv_response_identity(loaded, response_adapter=None)
+
+    loaded_none = SimpleNamespace(response_identity=None)
+    with pytest.raises(RuntimeError, match="no response_identity and no adapter"):
+        _resolve_persisted_euv_response_identity(loaded_none)
+
+    with pytest.raises(RuntimeError, match="Unable to resolve EUV response"):
+        _resolve_persisted_euv_response_identity(None)
+
+
+def test_resolve_persisted_euv_response_identity_uses_attr_or_adapter() -> None:
+    from examples.python.adaptive_ab_search_single_observation import (
+        _resolve_persisted_euv_response_identity,
+    )
+
+    attached = SimpleNamespace(version="v-attached", sha256="aa", summary={"source": "sav"})
+    assert (
+        _resolve_persisted_euv_response_identity(SimpleNamespace(response_identity=attached))
+        is attached
+    )
+
+    from_adapter = SimpleNamespace(version="v-adapter", sha256="bb", summary={"source": "dyn"})
+
+    class _Adapter:
+        def response_identity(self):
+            return from_adapter
+
+    assert (
+        _resolve_persisted_euv_response_identity(
+            SimpleNamespace(response_identity=None),
+            response_adapter=_Adapter(),
+        )
+        is from_adapter
+    )
+
+
+def test_matching_resume_preload_does_not_promote_or_rescore_maps():
+    class Cache:
+        _preserve_stored_search_trials = True
+
+        def hydrate_from_existing(self):
+            return 7
+
+        def promote_current_slice_trial_maps(self, **kwargs):
+            pytest.fail("matching resume must not rescore current-slice maps")
+
+        def promote_auxiliary_maps_from_store(self, **kwargs):
+            pytest.fail("matching resume must not rescore auxiliary maps")
+
+    assert _preload_search_cache_from_artifact(
+        Cache(), threshold=0.1, explicit_mask=None,
+        artifact_preexisting=True, hydrate_completed_points=True,
+    ) == (7, 0, 0, 0)
+
+
+@pytest.mark.parametrize("hydrate", [False, True])
+def test_indexed_new_recipe_preload_never_traverses_old_searches(hydrate):
+    class Cache:
+        _slice_map_index = object()
+        _preserve_stored_search_trials = False
+
+        def hydrate_from_existing(self):
+            return 2
+
+        def count_indexed_warm_points_from_index(self):
+            return 266
+
+        def promote_current_slice_trial_maps(self, **kwargs):
+            pytest.fail("must retrieve maps per point, not traverse prior searches")
+
+        def promote_auxiliary_maps_from_store(self, **kwargs):
+            pytest.fail("must not eagerly score auxiliary maps")
+
+    assert _preload_search_cache_from_artifact(
+        Cache(), threshold=0.1, explicit_mask=np.ones((2, 2), dtype=bool),
+        artifact_preexisting=True, hydrate_completed_points=hydrate,
+    ) == (2 if hydrate else 0, 0, 0, 266)
+
+
+def test_partial_warm_curve_is_not_declared_complete(tmp_path, monkeypatch):
+    import h5py
+    import examples.python.adaptive_ab_search_single_observation as cli
+
+    path = tmp_path / "partial.h5"
+    with h5py.File(path, "w") as f:
+        point = f.create_group("slices/euv_94/searches/saved/grid_points/p000000")
+        point.attrs.update(a=0.6, b=1.8, q0_start=0.001, n_trials=3, status="RUNNING")
+    trials = [dict(trial_index=i, q0=q, eta2=v, target_metric_value=v, mask_stage="explicit")
+              for i, (q, v) in enumerate([(0.001, 2.0), (0.002, 1.0), (0.003, 2.0)])]
+    cache = SimpleNamespace(
+        _preserve_stored_search_trials=True, _artifact_h5=path, _target_metric="eta2",
+        point_needs_completion=lambda a, b: True,
+        point_id_for=lambda a, b: "p000000",
+        _load_grid_trials_for_point=lambda point_id: trials,
+        _target_slice_key=lambda: "euv_94",
+        _resolve_search_id_from_artifact=lambda: "saved",
+        _grid_point_map_links_status=lambda **kwargs: True,
+    )
+    monkeypatch.setattr(cli, "_ab_point_from_completed_grid_point",
+                        lambda *a, **k: pytest.fail("partial trial curve is not a completed result"))
+    assert cli._PersistentPointCache.try_finalize_resume_point_from_stored_trials(cache, 0.6, 1.8) is None

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import time
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +21,13 @@ from .search_contract import (
     build_search_evaluation_config,
     search_evaluation_signature,
     search_id_from_evaluation_config,
+)
+from .map_store import (
+    MAP_IDENTITY_SCHEMA,
+    build_map_identity,
+    build_map_layer_provenance,
+    build_render_product_identity,
+    is_reusable_component,
 )
 from .obs_preprocessing import compute_array_content_sha256
 
@@ -68,7 +76,6 @@ MAP_REFS_DATASET = "map_refs_json"
 TRIAL_HISTORY_DATASET = "trial_history_json"
 POINT_SYNTHETIC_MAP_MACHINE_KEYS_DATASET = "synthetic_map_machine_keys_json"
 CANONICAL_ARTIFACT_CONTRACT_VERSION = "2026-05-28-slice-shared-canvas"
-MAP_IDENTITY_SCHEMA = "pychmp.map_identity.v1"
 ARTIFACT_GEOMETRY_SCHEMA = "pychmp.artifact_geometry.v1"
 FORWARD_MODEL_IDENTITY_VERSION = "pychmp.forward_model.file_sha256.v0"
 COMMON_ARTIFACT_GEOMETRY_DATASET = "artifact_geometry_json"
@@ -144,6 +151,7 @@ SEARCH_SPECIFIC_DIAGNOSTIC_KEYS = {
     "metrics_mask_source",
     "metrics_mask_fits",
     "mask_type",
+    "tr_mask_fits",
     "tr_mask_bmin_gauss",
     "tr_mask_source",
     "search_mode",
@@ -188,25 +196,37 @@ def is_h5_transient_read_error(exc: BaseException) -> bool:
 
 
 def _open_h5_with_lock_tolerance(path: Path | str, mode: str = "r", *args: Any, **kwargs: Any) -> h5py.File:
+    """Open an HDF5 file, retrying when process-local locking flags disagree.
+
+    Explicit ``locking=False`` / ``True`` both set HDF5's ``ignore_when_disabled``
+    to false. An already-open bare handle (or env / FS default) may use a different
+    ``ignore_when_disabled`` value, which surfaces as
+    ``file locking 'ignore disabled locks' flag values don't match``. Try the
+    common explicit modes, then ``best-effort``, then a bare open that inherits
+    the ambient policy so nested reads match an outer ``h5py.File(...)``.
+    Write and read paths share this policy.
+    """
     if "locking" in kwargs:
         return h5py.File(path, mode, *args, **kwargs)
 
-    text_mode = str(mode)
-    if text_mode in {"r", "r+"}:
-        last_exc: OSError | None = None
-        for locking in (False, True):
-            try:
-                return h5py.File(path, mode, *args, locking=locking, **kwargs)
-            except TypeError:
+    # ``None`` means omit the kwarg (inherit env / match an already-open bare handle).
+    locking_candidates: tuple[Any, ...] = (False, True, "best-effort", None)
+    last_exc: OSError | None = None
+    for locking in locking_candidates:
+        try:
+            if locking is None:
                 return h5py.File(path, mode, *args, **kwargs)
-            except OSError as exc:
-                if _is_h5_locking_flag_mismatch(exc):
-                    last_exc = exc
-                    continue
-                raise
-        if last_exc is not None:
-            raise last_exc
-    return h5py.File(path, mode, *args, **kwargs)
+            return h5py.File(path, mode, *args, locking=locking, **kwargs)
+        except TypeError:
+            # Older h5py without a locking= argument.
+            return h5py.File(path, mode, *args, **kwargs)
+        except OSError as exc:
+            if _is_h5_locking_flag_mismatch(exc):
+                last_exc = exc
+                continue
+            raise
+    assert last_exc is not None  # candidates either return or record a mismatch
+    raise last_exc
 
 
 _H5PY_FILE = _open_h5_with_lock_tolerance
@@ -249,44 +269,6 @@ def build_artifact_geometry_block(diagnostics: dict[str, Any]) -> dict[str, Any]
 def artifact_geometry_sha256(geometry_block: dict[str, Any]) -> str:
     canonical = json.dumps(geometry_block, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def build_map_identity(
-    *,
-    a: float,
-    b: float,
-    q0: float,
-    domain: str,
-    channel_or_frequency: str,
-    component: str,
-    forward_model_sha256: str,
-    ebtel_sha256: str,
-    artifact_geometry_sha256: str,
-    forward_model_identity_version: str = FORWARD_MODEL_IDENTITY_VERSION,
-    euv_response_sha256: str | None = None,
-    euv_response_identity_version: str | None = None,
-    array_name: str | None = None,
-) -> dict[str, Any]:
-    identity = {
-        "schema": MAP_IDENTITY_SCHEMA,
-        "forward_model_sha256": str(forward_model_sha256),
-        "forward_model_identity_version": str(forward_model_identity_version),
-        "ebtel_sha256": str(ebtel_sha256),
-        "artifact_geometry_sha256": str(artifact_geometry_sha256),
-        "a": float(a),
-        "b": float(b),
-        "q0": float(q0),
-        "domain": str(domain).strip().lower(),
-        "channel_or_frequency": str(channel_or_frequency),
-        "component": str(component).strip().lower(),
-    }
-    if array_name is not None:
-        identity["array_name"] = str(array_name)
-    if euv_response_sha256 is not None:
-        identity["euv_response_sha256"] = str(euv_response_sha256)
-    if euv_response_identity_version is not None:
-        identity["euv_response_identity_version"] = str(euv_response_identity_version)
-    return identity
 
 
 def _recombine_euv_raw_maps(
@@ -351,6 +333,8 @@ def _component_from_array_name(name: str) -> str | None:
         return mapping[lowered]
     if lowered.startswith("trial_raw_modeled_maps/"):
         return "stokes_i"
+    if lowered.endswith("/raw_modeled") or "/raw_modeled/" in lowered:
+        return "stokes_i"
     return None
 
 
@@ -388,6 +372,7 @@ def _map_identity_physical_keys_from_diagnostics(diagnostics: dict[str, Any]) ->
         "ebtel_sha256",
         "euv_response_sha256",
         "euv_response_identity_version",
+        "render_projection",
     ):
         if key in diagnostics and str(diagnostics.get(key, "")).strip():
             out[key] = diagnostics[key]
@@ -1134,7 +1119,7 @@ def _search_request_from_group(search_group: h5py.Group) -> dict[str, Any]:
 
 def _matching_search_id_for_request(searches_group: h5py.Group, request: dict[str, Any]) -> str | None:
     target_signature = search_evaluation_signature(request)
-    matches: list[tuple[int, str]] = []
+    matches: list[tuple[int, int, str]] = []
     for search_id in searches_group.keys():
         search_group = searches_group[search_id]
         existing_request = _search_request_from_group(search_group)
@@ -1145,12 +1130,20 @@ def _matching_search_id_for_request(searches_group: h5py.Group, request: dict[st
 
         if GRID_POINTS_GROUP in search_group:
             point_count = max(int(point_count), int(len(search_group[GRID_POINTS_GROUP])))
-        matches.append((int(point_count), str(search_id)))
+        lifecycle = (
+            _json_loads_or_empty(search_group["lifecycle_json"][()])
+            if "lifecycle_json" in search_group
+            else {}
+        )
+        status = str(lifecycle.get("status") or "").strip().lower()
+        active = bool(lifecycle.get("active", False))
+        completion_rank = 1 if status == "complete" and not active else 0
+        matches.append((completion_rank, int(point_count), str(search_id)))
     if not matches:
         return None
     # Prefer the most complete existing search when duplicates already exist.
-    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return matches[0][1]
+    matches.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return matches[0][2]
 
 
 def _search_lifecycle_payload(
@@ -1357,12 +1350,19 @@ def _resolve_observation_reference_payload(
     common: h5py.Group,
     *,
     search_group: h5py.Group | None = None,
+    allow_render_only: bool = False,
 ) -> dict[str, Any] | None:
     if search_group is not None and OBSERVATION_REF_GROUP in search_group:
         search_payload = _read_observation_ref_group(search_group[OBSERVATION_REF_GROUP])
         if search_payload.get("observed") is not None or search_payload.get("observation_canvas") is not None:
             return search_payload
     payload = _observation_ref_payload_from_common(common)
+    if (
+        payload is not None
+        and not allow_render_only
+        and bool(dict(payload.get("diagnostics") or {}).get("render_only_slice", False))
+    ):
+        return None
     if payload is not None and (
         payload.get("observed") is not None
         or payload.get("observation_canvas") is not None
@@ -1404,7 +1404,10 @@ def load_slice_observation_reference_payload(
                     payload.get("observed") is not None or payload.get("observation_canvas") is not None
                 ):
                     return payload
-        return _observation_ref_payload_from_common(common)
+        fallback = _observation_ref_payload_from_common(common)
+        if fallback is not None and bool(dict(fallback.get("diagnostics") or {}).get("render_only_slice", False)):
+            return None
+        return fallback
 
 
 def load_search_observation_reference_payload(
@@ -1447,6 +1450,7 @@ def _write_search_group(
     _create_text_dataset(search_group, "run_history_json", _json_dumps(list(run_history or [])))
     records_group = search_group.create_group("point_records")
     for record_order, payload in enumerate(point_records):
+        _write_search_tr_mask_if_available(search_group, diagnostics_out, payload)
         grp = records_group.create_group(f"r{record_order:06d}")
         _write_point_group(grp, payload, record_order=record_order)
     request = _search_request_from_diagnostics(diagnostics_out, layout=layout)
@@ -1885,6 +1889,34 @@ def assert_expand_grid_search_cli_argv_allowed(argv: list[str]) -> None:
         )
 
 
+def validate_pinned_search_evaluation_recipe(
+    profile: dict[str, Any],
+    *,
+    compatibility_signature: str,
+) -> None:
+    """Refuse expand/recompute when the live CLI recipe drifts from the stored request."""
+    request = dict(profile.get("request") or {})
+    if not request:
+        return
+    stored_signature = search_evaluation_signature(request)
+    expected = str(compatibility_signature or "").strip()
+    if not expected:
+        return
+    if stored_signature == expected:
+        return
+    search_id = str(profile.get("search_id") or "").strip() or "<search_id>"
+    stored_q0 = request.get("q0_search_stages")
+    raise SystemExit(
+        "Pinned search recipe mismatch for "
+        f"{search_id}: stored evaluation signature "
+        f"{stored_signature[:16]}… does not match the resolved CLI recipe "
+        f"{expected[:16]}…. "
+        f"Stored q0_search_stages={stored_q0!r}. "
+        "Use --expand-grid-search-id / --recompute-search-id only (no recipe overrides), "
+        "or start a new identity with --new-search-identity."
+    )
+
+
 def load_search_run_profile(
     h5_path: Path,
     *,
@@ -1949,6 +1981,15 @@ def apply_search_run_profile_to_namespace(
         args.obs_source = source_mode
     if source_mode == "external_fits" and fits_path:
         args.obs_path = Path(fits_path)
+    elif source_mode == "model_refmap":
+        args.obs_path = None
+        args.fits_file = None
+    observation_time = str(diagnostics.get("observation_time_original") or "").strip()
+    if observation_time and hasattr(args, "observation_time"):
+        args.observation_time = observation_time
+    model_time_reference = str(diagnostics.get("model_time_reference") or "").strip()
+    if model_time_reference:
+        setattr(args, "stored_model_time_reference", model_time_reference)
     map_id = diagnostics.get("observation_source_map_id")
     if map_id not in {None, ""}:
         args.obs_map_id = str(map_id)
@@ -1967,6 +2008,13 @@ def apply_search_run_profile_to_namespace(
     spectral_domain = str(diagnostics.get("spectral_domain") or "").strip().lower()
     if spectral_domain in {"mw", "euv", "uv", "generic"}:
         args.obs_domain = spectral_domain
+    observation_time = str(
+        diagnostics.get("observation_time_original")
+        or diagnostics.get("observation_time")
+        or ""
+    ).strip()
+    if observation_time:
+        args.observation_time = observation_time
     frequency_ghz = _profile_optional_float(diagnostics, "frequency_ghz", "active_frequency_ghz")
     if frequency_ghz is not None:
         args.obs_frequency_ghz = frequency_ghz
@@ -2003,6 +2051,9 @@ def apply_search_run_profile_to_namespace(
     threshold_metric = _opt_or_diag("threshold_metric")
     if threshold_metric is not None:
         args.threshold_metric = float(threshold_metric)
+    tr_mask_fits = diagnostics.get("tr_mask_fits")
+    if tr_mask_fits not in {None, ""}:
+        args.tr_mask_fits = Path(str(tr_mask_fits))
     tr_mask = diagnostics.get("tr_mask_bmin_gauss")
     if tr_mask is not None:
         args.tr_mask_bmin_gauss = float(tr_mask)
@@ -2048,6 +2099,15 @@ def apply_search_run_profile_to_namespace(
     if euv_response not in {None, ""}:
         args.euv_response_sav = Path(str(euv_response))
 
+    projection = request.get("render_projection") or diagnostics.get("render_projection")
+    if isinstance(projection, dict):
+        for key, field in (("parallel", "euv_parallel"), ("exact", "euv_exact")):
+            value = _profile_optional_bool(projection.get(key))
+            if value is not None:
+                setattr(args, field, value)
+        if projection.get("nthreads") is not None:
+            args.euv_projection_threads = int(projection["nthreads"])
+
     pixel_scale = _profile_optional_float(diagnostics, "map_dx_arcsec")
     if pixel_scale is not None and hasattr(args, "pixel_scale_arcsec"):
         args.pixel_scale_arcsec = pixel_scale
@@ -2092,8 +2152,12 @@ def apply_search_run_profile_to_namespace(
     emthreshold = diagnostics.get("emthreshold")
     if emthreshold is not None and hasattr(args, "emthreshold"):
         args.emthreshold = float(emthreshold)
-    q0_stages = diagnostics.get("q0_search_stages")
-    if isinstance(q0_stages, (list, tuple)) and q0_stages and hasattr(args, "q0_search_stages"):
+    from .q0_search import canonical_q0_search_stages_from_profile
+
+    q0_stages = canonical_q0_search_stages_from_profile(
+        {"request": request, "diagnostics": diagnostics}
+    )
+    if q0_stages and hasattr(args, "q0_search_stages"):
         args.q0_search_stages = ",".join(str(item) for item in q0_stages)
 
 
@@ -2173,6 +2237,12 @@ def register_sparse_search_in_artifact(
                 group_name="Bz_reference",
                 data=np.asarray(blos_data, dtype=float),
                 wcs_header=blos_header,
+            )
+        elif "common" in slice_group:
+            ensure_slice_common_psf_kernel(
+                slice_group["common"],
+                psf_kernel=psf_kernel,
+                diagnostics=diagnostics_out,
             )
         searches_group = slice_group.require_group(SEARCHES_GROUP)
         resolved_search_id = str(search_id or "").strip()
@@ -2254,13 +2324,36 @@ def _iter_slice_search_lifecycles(h5_path: Path) -> list[tuple[str, str, dict[st
     return records
 
 
+def search_lifecycle_completed_at_is_authoritative(lifecycle: dict[str, Any] | None) -> bool:
+    """True when ``completed_at`` belongs to this search, not a stale prior run.
+
+    Prefer explicit ``status``. Ignore ``completed_at`` that is earlier than
+    ``started_at`` (common when a resume reuses slice-common timestamps).
+    """
+    data = dict(lifecycle or {})
+    status = str(data.get("status", "") or "").strip().lower()
+    if status in {"in_progress", "running", "indexing", "pending", "failed", "aborted", "interrupted"}:
+        return False
+    if status in {"complete", "completed"}:
+        return True
+    completed_at = str(data.get("completed_at") or "").strip()
+    if not completed_at:
+        return False
+    started_at = str(data.get("started_at") or "").strip()
+    if started_at and completed_at < started_at:
+        return False
+    return True
+
+
 def search_lifecycle_is_in_progress(lifecycle: dict[str, Any] | None) -> bool:
     """True only for searches that are genuinely running, not stale active flags."""
     data = dict(lifecycle or {})
     status = str(data.get("status", "") or "").strip().lower()
     if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
         return False
-    if str(data.get("completed_at") or "").strip():
+    if status in {"in_progress", "running", "indexing"}:
+        return True
+    if search_lifecycle_completed_at_is_authoritative(data):
         return False
     if bool(data.get("in_progress", False)):
         return True
@@ -3191,7 +3284,11 @@ def load_scan_file(
         search_group = None
         if selected_search_id is not None and SEARCHES_GROUP in group and selected_search_id in group[SEARCHES_GROUP]:
             search_group = group[SEARCHES_GROUP][selected_search_id]
-        obs_ref_payload = _resolve_observation_reference_payload(common, search_group=search_group)
+        obs_ref_payload = _resolve_observation_reference_payload(
+            common,
+            search_group=search_group,
+            allow_render_only=True,
+        )
         if obs_ref_payload is None:
             raise KeyError(
                 f"observation reference not found for slice={selected_key!r} search={selected_search_id!r}"
@@ -3260,6 +3357,7 @@ def load_scan_file(
                     target_metric = decode_scalar(summary.attrs.get("target_metric", diagnostics.get("target_metric", b"chi2")))
                 else:
                     target_metric = str(diagnostics.get("target_metric", "chi2"))
+        resolved_psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         payload = _payload_from_point_records(
             observed=observed,
             sigma_map=sigma_map,
@@ -3267,7 +3365,7 @@ def load_scan_file(
             diagnostics=diagnostics,
             point_records=point_records,
             target_metric=target_metric,
-            psf_kernel=common_payload.get("psf_kernel"),
+            psf_kernel=resolved_psf_kernel,
             include_maps=include_maps,
         )
         selected_descriptor = next((item for item in descriptors if str(item["key"]) == str(selected_key)), None)
@@ -3278,7 +3376,7 @@ def load_scan_file(
         payload["search_records"] = search_records
         payload["selected_search_id"] = selected_search_id
         payload["selected_search"] = selected_search_record
-        payload["psf_kernel"] = common_payload.get("psf_kernel")
+        payload["psf_kernel"] = resolved_psf_kernel
         payload["psf_kernel_metadata"] = common_payload.get("psf_kernel_metadata")
         if not search_records:
             legacy_status = _search_status_from_records(payload.get("point_records", []))
@@ -3575,7 +3673,7 @@ def load_live_trial_plot_payload(
             return None
         common_payload = _read_common_group(group["common"])
         observed = np.asarray(common_payload.get("observed"), dtype=float)
-        psf_kernel = common_payload.get("psf_kernel")
+        psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         raw_display, modeled, residual, _has_raw = _derive_display_maps_from_raw(
             raw_modeled,
             observed_template=observed,
@@ -3608,6 +3706,7 @@ def load_selected_trial_plot_payload(
     trial_index: int | None = None,
     slice_key: str | None = None,
     search_id: str | None = None,
+    psf_kernel: np.ndarray | None = None,
 ) -> dict[str, Any] | None:
     from .grid_points import GRID_POINTS_GROUP, load_grid_point_trial_plot_payload
 
@@ -3633,6 +3732,7 @@ def load_selected_trial_plot_payload(
                         trial_index=trial_index,
                         slice_key=slice_key or selected_key,
                         search_id=selected_search_id,
+                        psf_kernel=psf_kernel,
                     )
         records_group: h5py.Group | None = None
         if selected_search_id is not None and SEARCHES_GROUP in group:
@@ -3711,11 +3811,16 @@ def load_selected_trial_plot_payload(
 
         common_payload = _read_common_group(group["common"])
         observed = np.asarray(common_payload.get("observed"), dtype=float)
-        psf_kernel = common_payload.get("psf_kernel")
+        if psf_kernel is not None:
+            from .psf import _normalized_psf_kernel_array
+
+            resolved_psf_kernel = _normalized_psf_kernel_array(psf_kernel)
+        else:
+            resolved_psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         raw_display, modeled, residual, _has_raw = _derive_display_maps_from_raw(
             raw_modeled,
             observed_template=observed,
-            psf_kernel=psf_kernel,
+            psf_kernel=resolved_psf_kernel,
         )
         if raw_display is None or modeled is None or residual is None:
             return None
@@ -3729,7 +3834,7 @@ def load_selected_trial_plot_payload(
             "residual": np.asarray(residual, dtype=float),
             "observed": observed,
             "wcs_header": common_payload["wcs_header"],
-            "psf_kernel": psf_kernel,
+            "psf_kernel": resolved_psf_kernel,
             "selected_slice_key": str(selected_key),
             "selected_search_id": str(selected_search_id) if selected_search_id is not None else None,
         }
@@ -3964,6 +4069,7 @@ def extract_artifact_identity_summary(
         "metrics_mask_fits",
         "metrics_mask_source",
         "mask_type",
+        "tr_mask_fits",
         "tr_mask_bmin_gauss",
         "tr_mask_source",
     )
@@ -3977,6 +4083,7 @@ def extract_artifact_identity_summary(
             "metrics_mask_fits",
             "metrics_mask_source",
             "mask_type",
+            "tr_mask_fits",
             "tr_mask_bmin_gauss",
             "tr_mask_source",
             COMPATIBILITY_SIGNATURE_KEY,
@@ -4224,13 +4331,6 @@ def _map_store_identity(
             "observer_b0sun_deg",
             "observer_dsun_cm",
             "observer_obs_time",
-            "psf_source",
-            "resolved_psf",
-            "psf_bmaj_arcsec",
-            "psf_bmin_arcsec",
-            "psf_bpa_deg",
-            "psf_ref_frequency_ghz",
-            "psf_scale_inverse_frequency",
             "render_channels",
             "render_frequencies_ghz",
         )
@@ -4257,6 +4357,7 @@ def _map_store_identity(
         artifact_geometry_sha256=artifact_geom_sha,
         euv_response_sha256=physical.get("euv_response_sha256"),
         euv_response_identity_version=physical.get("euv_response_identity_version"),
+        render_projection=physical.get("render_projection"),
         array_name=str(name),
     )
 
@@ -4279,6 +4380,19 @@ def _write_map_store_array(
         map_group = maps_group.create_group(map_id)
         map_group.create_dataset("data", data=arr, compression="gzip", compression_opts=4)
         _create_text_dataset(map_group, "identity_json", _json_dumps(identity))
+        component = str(identity.get("component") or "").strip().lower()
+        if is_reusable_component(component):
+            render_product = build_render_product_identity(identity)
+            map_layer = build_map_layer_provenance(identity)
+            _create_text_dataset(map_group, "render_product_json", _json_dumps(render_product))
+            _create_text_dataset(map_group, "map_layer_json", _json_dumps(map_layer))
+            map_group.attrs["render_product_id"] = np.bytes_(str(render_product["render_product_id"]))
+            map_group.attrs["map_layer_id"] = np.bytes_(str(map_layer["layer_id"]))
+            map_group.attrs["component"] = np.bytes_(component)
+            map_group.attrs["channel_or_frequency"] = np.bytes_(str(map_layer["channel_or_frequency"]))
+        from .slice_map_index import append_map_store_slice_index
+
+        append_map_store_slice_index(h5_file, identity=identity, map_key=map_id)
     return f"/{MAP_STORE_GROUP}/{MAP_STORE_MAPS_GROUP}/{map_id}"
 
 
@@ -4292,11 +4406,40 @@ def _write_point_map_ref(
 ) -> None:
     if data is None:
         return
+    identity = _synthetic_map_identity_for_store_name(
+        dict(normalized.get("diagnostics") or {}),
+        map_store_name=name,
+    )
+    if identity is None:
+        identity = _map_store_identity(name=name, normalized=normalized)
     map_refs[name] = _write_map_store_array(
         grp.file,
-        identity=_map_store_identity(name=name, normalized=normalized),
+        identity=identity,
         data=np.asarray(data, dtype=float),
     )
+
+
+def _synthetic_map_identity_for_store_name(
+    diagnostics: dict[str, Any],
+    *,
+    map_store_name: str,
+) -> dict[str, Any] | None:
+    requested = str(map_store_name or "").strip()
+    candidates = [requested]
+    if requested.startswith("extra/"):
+        candidates.append(requested[len("extra/") :])
+    else:
+        candidates.append(f"extra/{requested}")
+    candidate_set = set(candidates)
+    for entry in _synthetic_map_entries_from_diagnostics(diagnostics):
+        array_name = str(entry.get("map_store_array") or "").strip()
+        if array_name not in candidate_set:
+            continue
+        identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else None
+        if identity is None:
+            continue
+        return dict(identity)
+    return None
 
 
 def _synthetic_map_entries_from_diagnostics(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
@@ -4717,6 +4860,220 @@ def load_auxiliary_map_store_point_records(
     return out
 
 
+def _resolved_psf_kernel_from_common_payload(common_payload: dict[str, Any]) -> np.ndarray | None:
+    """Return slice PSF kernel from storage or rebuild from persisted diagnostics."""
+    from .psf import resolve_slice_psf_kernel
+
+    diagnostics = dict(common_payload.get("diagnostics") or {})
+    dx_arcsec = _optional_float(diagnostics.get("map_dx_arcsec"))
+    if dx_arcsec is None:
+        dx_arcsec = 2.0
+    dy_arcsec = _optional_float(diagnostics.get("map_dy_arcsec"))
+    if dy_arcsec is None:
+        dy_arcsec = float(dx_arcsec)
+    active_frequency_ghz = _optional_float(
+        diagnostics.get("active_frequency_ghz") or diagnostics.get("frequency_ghz")
+    )
+    return resolve_slice_psf_kernel(
+        stored_kernel=common_payload.get("psf_kernel"),
+        diagnostics=diagnostics,
+        dx_arcsec=float(dx_arcsec),
+        dy_arcsec=float(dy_arcsec),
+        active_frequency_ghz=active_frequency_ghz,
+    )
+
+
+def ensure_slice_common_psf_kernel(
+    common: h5py.Group,
+    *,
+    psf_kernel: np.ndarray | None,
+    diagnostics: dict[str, Any],
+) -> bool:
+    """Persist ``common/psf_kernel`` when missing (per-slice artifact contract)."""
+    if COMMON_PSF_KERNEL_DATASET in common:
+        return False
+    kernel = None
+    try:
+        from .psf import _normalized_psf_kernel_array
+
+        kernel = _normalized_psf_kernel_array(psf_kernel)
+    except Exception:
+        kernel = None
+    if kernel is None:
+        return False
+    common.create_dataset(
+        COMMON_PSF_KERNEL_DATASET,
+        data=np.asarray(kernel, dtype=np.float32),
+        compression="gzip",
+        compression_opts=4,
+    )
+    kernel_meta = {
+        "source": diagnostics.get("psf_source"),
+        "resolved_psf": diagnostics.get("resolved_psf"),
+        "shape": [int(v) for v in kernel.shape],
+        "normalized": True,
+    }
+    _create_text_dataset(common, COMMON_PSF_KERNEL_META_DATASET, _json_dumps(kernel_meta))
+    return True
+
+
+def ensure_slice_common_psf_kernel_in_file(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    psf_kernel: np.ndarray | None,
+    diagnostics: dict[str, Any],
+) -> bool:
+    """Backfill missing slice-common PSF kernel datasets in an existing artifact."""
+    if not Path(h5_path).exists():
+        return False
+    slice_name = str(slice_key or "").strip()
+    if not slice_name:
+        return False
+    with _H5PY_FILE(Path(h5_path), "a") as h5_file:
+        if SLICE_CONTAINER_GROUP not in h5_file or slice_name not in h5_file[SLICE_CONTAINER_GROUP]:
+            return False
+        slice_group = h5_file[SLICE_CONTAINER_GROUP][slice_name]
+        if "common" not in slice_group:
+            return False
+        return ensure_slice_common_psf_kernel(
+            slice_group["common"],
+            psf_kernel=psf_kernel,
+            diagnostics=dict(diagnostics),
+        )
+
+
+def _store_common_observation_maps(
+    common: h5py.Group,
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    diagnostics: dict[str, Any],
+    observation_canvas: np.ndarray | None = None,
+    sigma_canvas: np.ndarray | None = None,
+    canvas_wcs_header: fits.Header | None = None,
+    only_missing: bool = False,
+) -> dict[str, Any]:
+    """Write ``observed`` and ``sigma_map`` the same way ``_write_common_group`` does.
+
+    Arrays must already be the area-corrected reference. This function does not regrid.
+    ``only_missing`` adds datasets that were stripped and leaves maps already stored.
+    """
+    if only_missing and "observed" in common:
+        observed_store = np.asarray(common["observed"], dtype=np.float32)
+    else:
+        observed_store = np.asarray(observed, dtype=np.float32)
+    if only_missing and "sigma_map" in common:
+        sigma_store = np.asarray(common["sigma_map"], dtype=np.float32)
+    else:
+        sigma_store = np.asarray(sigma_map, dtype=np.float32)
+    canvas_for_identity = observation_canvas
+    sigma_canvas_for_identity = sigma_canvas
+    if only_missing and "observation_canvas" in common and "sigma_canvas" in common:
+        canvas_for_identity = np.asarray(common["observation_canvas"], dtype=np.float32)
+        sigma_canvas_for_identity = np.asarray(common["sigma_canvas"], dtype=np.float32)
+    diagnostics_out = _sync_preprocessed_content_identity_diagnostics(
+        diagnostics,
+        observed=observed_store,
+        sigma_map=sigma_store,
+        observation_canvas=canvas_for_identity,
+        sigma_canvas=sigma_canvas_for_identity,
+    )
+    if not (only_missing and "observed" in common):
+        common.create_dataset("observed", data=observed_store, compression="gzip", compression_opts=4)
+    if not (only_missing and "sigma_map" in common):
+        common.create_dataset("sigma_map", data=sigma_store, compression="gzip", compression_opts=4)
+    if (
+        canvas_for_identity is not None
+        and sigma_canvas_for_identity is not None
+        and canvas_wcs_header is not None
+    ):
+        if "observation_canvas" not in common:
+            common.create_dataset(
+                "observation_canvas",
+                data=np.asarray(canvas_for_identity, dtype=np.float32),
+                compression="gzip",
+                compression_opts=4,
+            )
+        if "sigma_canvas" not in common:
+            common.create_dataset(
+                "sigma_canvas",
+                data=np.asarray(sigma_canvas_for_identity, dtype=np.float32),
+                compression="gzip",
+                compression_opts=4,
+            )
+        if "canvas_wcs_header" not in common:
+            _create_text_dataset(
+                common,
+                "canvas_wcs_header",
+                canvas_wcs_header.tostring(sep="\n", endcard=True),
+            )
+    return diagnostics_out
+
+
+def ensure_slice_common_observation_maps(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    observed: np.ndarray | None,
+    sigma_map: np.ndarray | None,
+    observation_canvas: np.ndarray | None = None,
+    sigma_canvas: np.ndarray | None = None,
+    canvas_wcs_header: fits.Header | None = None,
+) -> bool:
+    """Backfill missing ``common/observed`` and ``common/sigma_map`` from a prepared reference.
+
+    ``observed`` and ``sigma_map`` are the maps returned by
+    ``resolve_slice_observation_reference``. Pixel-area scaling stays in that
+    prepare step; this only persists the pair when either dataset is absent.
+    """
+    if observed is None or sigma_map is None:
+        return False
+    slice_name = str(slice_key or "").strip()
+    if not slice_name or not Path(h5_path).exists():
+        return False
+    with _H5PY_FILE(Path(h5_path), "r") as h5_file:
+        slice_group, _descriptors, _selected_key = _resolve_slice_group(
+            h5_file,
+            slice_key=slice_name,
+            allow_missing=True,
+        )
+        if slice_group is None or "common" not in slice_group:
+            return False
+        common = slice_group["common"]
+        if "observed" in common and "sigma_map" in common:
+            return False
+    with _H5PY_FILE(Path(h5_path), "a") as h5_file:
+        slice_group, _descriptors, _selected_key = _resolve_slice_group(
+            h5_file,
+            slice_key=slice_name,
+            allow_missing=True,
+        )
+        if slice_group is None or "common" not in slice_group:
+            return False
+        common = slice_group["common"]
+        if "observed" in common and "sigma_map" in common:
+            return False
+        diagnostics: dict[str, Any] = {}
+        if "diagnostics_json" in common:
+            parsed = json.loads(decode_scalar(common["diagnostics_json"][()]))
+            if isinstance(parsed, dict):
+                diagnostics = parsed
+        diagnostics_out = _store_common_observation_maps(
+            common,
+            observed=np.asarray(observed, dtype=float),
+            sigma_map=np.asarray(sigma_map, dtype=float),
+            diagnostics=diagnostics,
+            observation_canvas=observation_canvas,
+            sigma_canvas=sigma_canvas,
+            canvas_wcs_header=canvas_wcs_header,
+            only_missing=True,
+        )
+        if "diagnostics_json" in common:
+            _replace_text_dataset(common, "diagnostics_json", _json_dumps(diagnostics_out))
+    return True
+
+
 def _write_common_group(
     common: h5py.Group,
     *,
@@ -4739,31 +5096,15 @@ def _write_common_group(
     diagnostics_out = dict(diagnostics)
     diagnostics_out.setdefault("artifact_geometry_sha256", geometry_sha)
     if store_observation_maps:
-        observed_store = np.asarray(observed, dtype=np.float32)
-        sigma_store = np.asarray(sigma_map, dtype=np.float32)
-        diagnostics_out = _sync_preprocessed_content_identity_diagnostics(
-            diagnostics_out,
-            observed=observed_store,
-            sigma_map=sigma_store,
+        diagnostics_out = _store_common_observation_maps(
+            common,
+            observed=observed,
+            sigma_map=sigma_map,
+            diagnostics=diagnostics_out,
             observation_canvas=observation_canvas,
             sigma_canvas=sigma_canvas,
+            canvas_wcs_header=canvas_wcs_header,
         )
-        common.create_dataset("observed", data=observed_store, compression="gzip", compression_opts=4)
-        common.create_dataset("sigma_map", data=sigma_store, compression="gzip", compression_opts=4)
-        if observation_canvas is not None and sigma_canvas is not None and canvas_wcs_header is not None:
-            common.create_dataset(
-                "observation_canvas",
-                data=np.asarray(observation_canvas, dtype=np.float32),
-                compression="gzip",
-                compression_opts=4,
-            )
-            common.create_dataset(
-                "sigma_canvas",
-                data=np.asarray(sigma_canvas, dtype=np.float32),
-                compression="gzip",
-                compression_opts=4,
-            )
-            _create_text_dataset(common, "canvas_wcs_header", canvas_wcs_header.tostring(sep="\n", endcard=True))
     _create_text_dataset(common, "wcs_header", wcs_header.tostring(sep="\n", endcard=True))
     _create_text_dataset(common, "diagnostics_json", _json_dumps(diagnostics_out))
     _create_text_dataset(common, COMMON_ARTIFACT_CONTRACT_VERSION_DATASET, CANONICAL_ARTIFACT_CONTRACT_VERSION)
@@ -4772,25 +5113,11 @@ def _write_common_group(
     _create_text_dataset(common, COMMON_SLICE_DESCRIPTORS_DATASET, _json_dumps(slice_descriptors))
     _create_text_dataset(common, COMMON_TARGET_SLICE_KEY_DATASET, str(target_slice_key))
     _create_text_dataset(common, COMMON_TRIAL_LOGGING_POLICY_DATASET, _json_dumps(trial_logging_policy))
-    if psf_kernel is not None:
-        kernel = np.asarray(psf_kernel, dtype=float)
-        if kernel.ndim == 2 and kernel.size > 0:
-            kernel_sum = float(np.nansum(kernel))
-            if np.isfinite(kernel_sum) and kernel_sum != 0.0:
-                kernel = kernel / kernel_sum
-            common.create_dataset(
-                COMMON_PSF_KERNEL_DATASET,
-                data=np.asarray(kernel, dtype=np.float32),
-                compression="gzip",
-                compression_opts=4,
-            )
-            kernel_meta = {
-                "source": diagnostics.get("psf_source"),
-                "resolved_psf": diagnostics.get("resolved_psf"),
-                "shape": [int(v) for v in kernel.shape],
-                "normalized": True,
-            }
-            _create_text_dataset(common, COMMON_PSF_KERNEL_META_DATASET, _json_dumps(kernel_meta))
+    ensure_slice_common_psf_kernel(
+        common,
+        psf_kernel=psf_kernel,
+        diagnostics=diagnostics,
+    )
     if blos_reference is not None:
         refmaps = common.create_group("refmaps")
         blos_data, blos_header = blos_reference
@@ -4971,8 +5298,31 @@ def _copy_legacy_root_layout_to_slice(src: h5py.File, dst_slice: h5py.Group) -> 
 
 
 def _copy_existing_map_store(src: h5py.File, dst: h5py.File) -> None:
-    if MAP_STORE_GROUP in src and MAP_STORE_GROUP not in dst:
-        src.copy(src[MAP_STORE_GROUP], dst, name=MAP_STORE_GROUP)
+    if MAP_STORE_GROUP not in src or MAP_STORE_GROUP in dst:
+        return
+    src_ms = src[MAP_STORE_GROUP]
+    dst_ms = dst.create_group(MAP_STORE_GROUP)
+    skipped: list[str] = []
+    for name in src_ms.keys():
+        if name == MAP_STORE_MAPS_GROUP:
+            continue
+        try:
+            src.copy(src_ms[name], dst_ms, name=name)
+        except OSError as exc:
+            skipped.append(f"{name}: {exc}")
+    dst_maps = dst_ms.require_group(MAP_STORE_MAPS_GROUP)
+    for map_id in src_ms[MAP_STORE_MAPS_GROUP].keys():
+        try:
+            src.copy(src_ms[MAP_STORE_MAPS_GROUP][map_id], dst_maps, name=map_id)
+        except OSError as exc:
+            skipped.append(f"maps/{map_id}: {exc}")
+    if skipped:
+        warnings.warn(
+            "map_store copy skipped "
+            f"{len(skipped)} corrupt or unreadable object(s); first: {skipped[0]}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def write_grid_scan_artifact(
@@ -5220,6 +5570,49 @@ def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order
     _create_text_dataset(grp, "diagnostics_json", _json_dumps(diagnostics_out))
 
 
+def _write_search_tr_mask_if_available(
+    search_group: h5py.Group,
+    diagnostics: dict[str, Any],
+    point_payload: dict[str, Any],
+) -> None:
+    """Store the actual EUV TR mask used by this search identity."""
+
+    if "tr_mask" in search_group:
+        return
+    mask = point_payload.get("euv_tr_mask")
+    if mask is None:
+        return
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.ndim != 2 or mask_arr.size <= 0:
+        return
+    ds = search_group.create_dataset(
+        "tr_mask",
+        data=mask_arr.astype(np.uint8),
+        compression="gzip",
+        compression_opts=4,
+    )
+    source = diagnostics.get("tr_mask_source")
+    description = "TR mask stored by EUV search"
+    if source == "explicit_fits":
+        description = "TR mask: explicit FITS"
+    elif source == "abs_blos_ge_bmin":
+        try:
+            description = f"TR mask: |B_los| >= {float(diagnostics.get('tr_mask_bmin_gauss')):.0f} G"
+        except Exception:
+            description = "TR mask: |B_los| threshold"
+    ds.attrs["description"] = np.bytes_(description)
+    ds.attrs["source"] = np.bytes_(str(source or "unknown"))
+    if diagnostics.get("tr_mask_fits") not in {None, ""}:
+        ds.attrs["source_path"] = np.bytes_(str(diagnostics.get("tr_mask_fits")))
+    if diagnostics.get("tr_mask_bmin_gauss") is not None:
+        try:
+            ds.attrs["bmin_gauss"] = float(diagnostics.get("tr_mask_bmin_gauss"))
+        except Exception:
+            pass
+    ds.attrs["selected_pixels"] = int(np.count_nonzero(mask_arr))
+    ds.attrs["total_pixels"] = int(mask_arr.size)
+
+
 def write_point_scan_artifact(
     out_h5: Path,
     *,
@@ -5451,6 +5844,12 @@ def append_scan_point_record(
                             psf_kernel=psf_kernel,
                             run_history=None,
                         )
+                    else:
+                        ensure_slice_common_psf_kernel(
+                            slice_group["common"],
+                            psf_kernel=psf_kernel,
+                            diagnostics=diagnostics_out,
+                        )
                 searches_group = slice_group.require_group(SEARCHES_GROUP)
                 layout_payload = {"kind": "point_list"}
                 request_payload = _search_request_from_diagnostics(diagnostics_out, layout=layout_payload)
@@ -5472,6 +5871,7 @@ def append_scan_point_record(
                         SEARCH_REQUEST_DATASET,
                         _json_dumps(request_payload),
                     )
+                _write_search_tr_mask_if_available(search_group, diagnostics_out, point_payload)
                 search_records = search_group.require_group("point_records")
                 search_orders = [int(search_records[name].attrs.get("record_order", -1)) for name in search_records.keys()]
                 search_next_order = max(search_orders, default=-1) + 1

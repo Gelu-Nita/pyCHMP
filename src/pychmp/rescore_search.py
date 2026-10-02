@@ -184,8 +184,17 @@ def _load_slice_write_context(
         raise RescoreBuildError(f"Slice {slice_key!r} common maps are incomplete")
     diagnostics = dict(profile_diagnostics)
     diagnostics.update(dict(common_payload.get("diagnostics") or {}))
+    max_shift = diagnostics.get("max_shift_arcsec")
+    if max_shift in {None, "", 0, 0.0}:
+        diagnostics["max_shift_arcsec"] = (
+            profile_diagnostics.get("max_shift_arcsec")
+            or diagnostics.get("slice_canvas_max_shift_arcsec")
+            or 20.0
+        )
     blos_reference = common_payload.get("blos_reference")
-    psf_kernel = common_payload.get("psf_kernel")
+    from .ab_scan_artifacts import _resolved_psf_kernel_from_common_payload
+
+    psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
     diagnostics["target_slice_key"] = str(slice_key)
     return _SliceWriteContext(
         observed=np.asarray(observed, dtype=float),
@@ -223,7 +232,11 @@ def _evaluation_context_from_diagnostics(
             identity=dict(obs_ref_payload.get("identity") or obs_ref_payload.get("diagnostics") or {}),
             restored_from_artifact=True,
             shift_policy=str(write_ctx.diagnostics.get("shift_policy") or "auto"),
-            max_shift_arcsec=write_ctx.diagnostics.get("max_shift_arcsec"),
+            max_shift_arcsec=float(
+                write_ctx.diagnostics.get("max_shift_arcsec")
+                or write_ctx.diagnostics.get("slice_canvas_max_shift_arcsec")
+                or 20.0
+            ),
             xy_shift_arcsec=(
                 float(write_ctx.diagnostics.get("xy_shift_arcsec", [0.0, 0.0])[0]),
                 float(write_ctx.diagnostics.get("xy_shift_arcsec", [0.0, 0.0])[1]),
@@ -359,6 +372,7 @@ def build_rescore_sidecar(
     footprint: FootprintKind = "source",
     sidecar_path: Path | None = None,
     target_search_id: str | None = None,
+    tr_mask_fits: Path | None = None,
     dry_run: bool = False,
 ) -> RescoreBuildReport:
     """Rescore map_store trials into a sidecar search (read-only on the main artifact)."""
@@ -379,10 +393,21 @@ def build_rescore_sidecar(
         source_search_id=source_search_id,
         profile_diagnostics=dict(profile["diagnostics"]),
     )
+    obs_ref_payload = _load_observation_ref_payload(artifact_h5, slice_key=slice_key, search_id=source_search_id)
+    if obs_ref_payload is not None:
+        observed_ref = obs_ref_payload.get("observed")
+        sigma_ref = obs_ref_payload.get("sigma_map")
+        wcs_ref = obs_ref_payload.get("wcs_header")
+        if observed_ref is not None and sigma_ref is not None and isinstance(wcs_ref, fits.Header):
+            write_ctx.observed = np.asarray(observed_ref, dtype=float)
+            write_ctx.sigma_map = np.asarray(sigma_ref, dtype=float)
+            write_ctx.wcs_header = wcs_ref.copy()
+            write_ctx.diagnostics.update(dict(obs_ref_payload.get("diagnostics") or {}))
+            write_ctx.diagnostics["target_slice_key"] = str(slice_key)
     slice_map_index = build_slice_map_index(artifact_h5, slice_key=slice_key)
     evaluation_context = _evaluation_context_from_diagnostics(
         write_ctx,
-        obs_ref_payload=_load_observation_ref_payload(artifact_h5, slice_key=slice_key, search_id=source_search_id),
+        obs_ref_payload=obs_ref_payload,
     )
     target_metric = str(write_ctx.diagnostics.get("target_metric") or "chi2")
     threshold = float(write_ctx.diagnostics.get("metrics_mask_threshold", write_ctx.diagnostics.get("threshold", 0.1)))
@@ -394,6 +419,23 @@ def build_rescore_sidecar(
         rescore_pass=rescore_pass,
         footprint=footprint,
     )
+    tr_region_mask = None
+    tr_mask_source = None
+    if tr_mask_fits is not None:
+        mask_path = Path(tr_mask_fits).expanduser().resolve()
+        if not mask_path.exists():
+            raise RescoreBuildError(f"TR-mask FITS not found: {mask_path}")
+        tr_region_mask = np.asarray(fits.getdata(mask_path), dtype=bool)
+        if tr_region_mask.shape != tuple(np.asarray(write_ctx.observed).shape):
+            raise RescoreBuildError(
+                f"TR-mask shape {tr_region_mask.shape} does not match observation shape "
+                f"{tuple(np.asarray(write_ctx.observed).shape)}"
+            )
+        tr_mask_source = str(mask_path)
+        diagnostics["tr_mask_source"] = "external_fits"
+        diagnostics["tr_mask_fits"] = str(mask_path)
+        diagnostics["tr_mask_selected_pixels"] = int(np.count_nonzero(tr_region_mask))
+        diagnostics["tr_mask_total_pixels"] = int(tr_region_mask.size)
     diagnostics["selected_search_id"] = resolved_target
     diagnostics["search_id"] = resolved_target
 
@@ -483,7 +525,12 @@ def build_rescore_sidecar(
             threshold=float(threshold),
             explicit_mask=None,
             target_metric=target_metric,
+            tr_region_mask=tr_region_mask,
+            tr_mask_source=tr_mask_source,
+            observed_template_override=write_ctx.observed,
+            psf_kernel_override=write_ctx.psf_kernel,
             use_emthreshold=use_emthreshold,
+            psf_kernel=write_ctx.psf_kernel,
         )
         if not events:
             apply_grid_point_failed(
@@ -535,6 +582,7 @@ def build_rescore_sidecar(
         "points_rescored": points_rescored,
         "points_failed": points_failed,
         "trial_count": trial_count,
+        "tr_mask_fits": None if tr_mask_fits is None else str(Path(tr_mask_fits).expanduser().resolve()),
         "status": "ready",
     }
     _write_sidecar_meta(resolved_sidecar, meta)
@@ -669,6 +717,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_parser_cmd.add_argument("--sidecar", type=Path, default=None, help="Optional sidecar output path")
     build_parser_cmd.add_argument("--target-search-id", default=None, help="Override derived {root}_rN id")
+    build_parser_cmd.add_argument(
+        "--tr-mask-fits",
+        type=Path,
+        default=None,
+        help="Optional FOV-sampled binary TR mask FITS used to recombine stored EUV corona/TR components",
+    )
     build_parser_cmd.add_argument("--dry-run", action="store_true", help="Report coverage without writing a sidecar")
 
     commit_parser_cmd = subparsers.add_parser("commit", help="Merge sidecar search into the main artifact")
@@ -703,6 +757,7 @@ def main(argv: list[str] | None = None) -> int:
                 footprint=args.footprint,
                 sidecar_path=args.sidecar,
                 target_search_id=args.target_search_id,
+                tr_mask_fits=args.tr_mask_fits,
                 dry_run=bool(args.dry_run),
             )
             return 0

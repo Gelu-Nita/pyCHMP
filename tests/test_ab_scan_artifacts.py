@@ -47,13 +47,18 @@ from pychmp.ab_scan_artifacts import (
     write_active_point_snapshot,
     scan_artifact_compatibility_issues,
     validate_scan_artifact_compatibility,
+    validate_pinned_search_evaluation_recipe,
     validate_scan_artifact_reuse_preflight,
     write_single_point_scan_file,
     write_live_trial_point,
     write_point_scan_artifact,
 )
 from pychmp import ab_scan_artifacts
-from pychmp.ab_scan_artifacts import _is_h5_locking_flag_mismatch, is_h5_transient_read_error
+from pychmp.ab_scan_artifacts import (
+    _is_h5_locking_flag_mismatch,
+    _open_h5_with_lock_tolerance,
+    is_h5_transient_read_error,
+)
 from pychmp.search_contract import build_search_evaluation_config
 
 
@@ -153,6 +158,10 @@ def _make_blos_reference() -> tuple[np.ndarray, fits.Header]:
 def test_is_h5_locking_flag_mismatch_detects_h5py_message() -> None:
     exc = OSError("Unable to synchronously open file (file locking flag values don't match)")
     assert _is_h5_locking_flag_mismatch(exc)
+    ignore_disabled = OSError(
+        "Unable to synchronously open file (file locking 'ignore disabled locks' flag values don't match)"
+    )
+    assert _is_h5_locking_flag_mismatch(ignore_disabled)
     assert not _is_h5_locking_flag_mismatch(OSError("No such file"))
 
 
@@ -161,7 +170,25 @@ def test_is_h5_transient_read_error_detects_symbol_table_and_lock_races() -> Non
     assert is_h5_transient_read_error(sym)
     lock = OSError("Unable to synchronously open file (file locking flag values don't match)")
     assert is_h5_transient_read_error(lock)
+    ignore_disabled = OSError(
+        "Unable to synchronously open file (file locking 'ignore disabled locks' flag values don't match)"
+    )
+    assert is_h5_transient_read_error(ignore_disabled)
     assert not is_h5_transient_read_error(ValueError("bad symbol table node signature"))
+
+
+def test_open_h5_with_lock_tolerance_succeeds_with_bare_outer_handle(tmp_path: Path) -> None:
+    """Nested open must succeed when an outer bare ``h5py.File`` is already held."""
+    path = tmp_path / "nested_open.h5"
+    with h5py.File(path, "w") as created:
+        created.create_dataset("probe", data=[1])
+    with h5py.File(path, "r") as _outer:
+        inner = _open_h5_with_lock_tolerance(path, "r")
+        try:
+            assert "probe" in inner
+            assert list(inner["probe"][...]) == [1]
+        finally:
+            inner.close()
 
 
 def test_active_point_snapshot_round_trip(tmp_path: Path) -> None:
@@ -567,6 +594,17 @@ def test_point_artifact_persists_single_common_psf_kernel(tmp_path: Path) -> Non
     with h5py.File(out_h5, "r") as handle:
         assert f"slices/{selected_slice_key}/common/psf_kernel" in handle
         assert f"slices/{selected_slice_key}/common/psf_kernel_meta_json" in handle
+        maps = handle[f"{MAP_STORE_GROUP}/{MAP_STORE_MAPS_GROUP}"]
+        assert len(maps) >= 1
+        for map_group in maps.values():
+            identity = json.loads(map_group["identity_json"][()].decode())
+            assert "psf_source" not in identity
+            assert "resolved_psf" not in identity
+            if str(identity.get("component", "")).lower() in {"stokes_i", "stokes_v", "corona", "tr"}:
+                assert "render_product_json" in map_group
+                assert "map_layer_json" in map_group
+                layer = json.loads(map_group["map_layer_json"][()].decode())
+                assert layer["render_product_id"] == map_group.attrs["render_product_id"].decode()
 
 
 def test_validate_scan_artifact_compatibility_rejects_header_mismatch(tmp_path: Path) -> None:
@@ -1085,6 +1123,65 @@ def test_load_search_run_profile_and_apply_to_namespace(tmp_path: Path) -> None:
     assert args.target_metric == "eta2"
     assert args.render_frequencies_ghz == "1.4,6.9"
     assert args.execution_policy == "serial"
+
+
+def test_apply_search_run_profile_clears_obs_path_for_model_refmap() -> None:
+    stale_path = Path("/tmp/stale_external.fits")
+    profile = {
+        "diagnostics": {
+            "observation_source_mode": "model_refmap",
+            "observation_source_path": "/tmp/should_not_be_used.fits",
+            "fits_file": "/tmp/should_not_be_used.fits",
+            "observation_source_map_id": "AIA_94",
+            "model_path": "/tmp/model.h5",
+            "observation_time_original": "2012-07-12T04:46:23.340",
+            "model_time_reference": "2012-07-12T04:46:23.340",
+        },
+        "request": {},
+    }
+    args = Namespace(
+        fits_file=stale_path,
+        obs_path=stale_path,
+        obs_source=None,
+        obs_map_id=None,
+        model_h5=None,
+        model_h5_override=None,
+        ebtel_path=None,
+        obs_domain=None,
+        obs_frequency_ghz=None,
+        observation_time=None,
+    )
+
+    apply_search_run_profile_to_namespace(args, profile)
+
+    assert args.obs_source == "model_refmap"
+    assert args.obs_path is None
+    assert args.fits_file is None
+    assert args.obs_map_id == "AIA_94"
+    assert args.observation_time == "2012-07-12T04:46:23.340"
+    assert args.stored_model_time_reference == "2012-07-12T04:46:23.340"
+
+
+def test_apply_search_run_profile_prefers_request_q0_stages(tmp_path: Path) -> None:
+    args = Namespace(q0_search_stages=None)
+    profile = {
+        "request": {"q0_search_stages": ["data"]},
+        "diagnostics": {"q0_search_stages": ["union"]},
+    }
+    apply_search_run_profile_to_namespace(args, profile)
+    assert args.q0_search_stages == "data"
+
+
+def test_validate_pinned_search_evaluation_recipe_rejects_drift() -> None:
+    profile = {
+        "search_id": "search_abc",
+        "request": {"schema": "pychmp.search_evaluation.v1", "q0_search_stages": ["data"], "target_metric": "eta2"},
+    }
+    with pytest.raises(SystemExit, match="Pinned search recipe mismatch"):
+        validate_pinned_search_evaluation_recipe(
+            profile,
+            compatibility_signature="deadbeef" * 4,
+        )
 
 
 def test_validate_scan_artifact_compatibility_allows_sparse_target_metric_change(tmp_path: Path) -> None:
@@ -1609,9 +1706,14 @@ def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Pa
             "label": "EUV 193 best",
             "identity": {
                 "schema": "pychmp.synthetic_map_db.v1",
+                "domain": "euv",
                 "domain_label": "euv",
                 "channel_or_frequency": "193",
+                "component": "stokes_i",
                 "map_role": "rendered_best",
+                "a": 0.3,
+                "b": 2.7,
+                "q0": 2.5,
             },
         },
         {
@@ -1620,9 +1722,14 @@ def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Pa
             "label": "EUV 193 trial 0",
             "identity": {
                 "schema": "pychmp.synthetic_map_db.v1",
+                "domain": "euv",
                 "domain_label": "euv",
                 "channel_or_frequency": "193",
+                "component": "stokes_i",
                 "map_role": "trial_000_rendered",
+                "a": 0.3,
+                "b": 2.7,
+                "q0": 2.0,
             },
         },
         {
@@ -1631,9 +1738,14 @@ def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Pa
             "label": "EUV 193 trial 1",
             "identity": {
                 "schema": "pychmp.synthetic_map_db.v1",
+                "domain": "euv",
                 "domain_label": "euv",
                 "channel_or_frequency": "193",
+                "component": "stokes_i",
                 "map_role": "trial_001_rendered",
+                "a": 0.3,
+                "b": 2.7,
+                "q0": 2.5,
             },
         },
     ]
@@ -1689,6 +1801,18 @@ def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Pa
     assert records[0]["fit_q0_trials"] == (2.0, 2.5)
     np.testing.assert_allclose(records[0]["trial_modeled_maps"][0], np.full((2, 2), 2.0, dtype=float))
     np.testing.assert_allclose(records[0]["modeled_best"], np.full((2, 2), 2.5, dtype=float))
+    with h5py.File(out_h5, "r") as handle:
+        record = handle["slices/euv_171/searches"][str(load_scan_file(out_h5)["selected_search_id"])]["point_records"]["r000000"]
+        refs = json.loads(record["map_refs_json"][()].decode())
+        for ref_key in (
+            "extra/synthetic/syn-193-best",
+            "extra/synthetic/syn-193-trial0",
+            "extra/synthetic/syn-193-trial1",
+        ):
+            identity = json.loads(handle[refs[ref_key]]["identity_json"][()].decode())
+            assert identity["domain"] == "euv"
+            assert identity["channel_or_frequency"] == "193"
+            assert identity["component"] == "stokes_i"
 
 
 def test_auxiliary_map_store_records_disable_synthetic_key_lookup_uses_legacy_prefix(tmp_path: Path) -> None:
@@ -2935,3 +3059,15 @@ def test_grid_indices_for_coordinates_finds_missing_cells() -> None:
     model = ab_scan_artifacts.build_patch_grid_model(payload)
     assert ab_scan_artifacts.find_record_for_point(model, -0.25, 4.0) is None
     assert ab_scan_artifacts.grid_indices_for_coordinates(payload, -0.25, 4.0) == (1, 1)
+
+
+def test_pinned_search_restores_projection_from_canonical_request() -> None:
+    args = Namespace(euv_parallel=False, euv_exact=True, euv_projection_threads=0)
+    profile = {
+        "request": {"render_projection": {"parallel": True, "exact": False, "nthreads": 8}},
+        "diagnostics": {"render_projection": {"parallel": False, "exact": True, "nthreads": 2}},
+    }
+    apply_search_run_profile_to_namespace(args, profile)
+    assert args.euv_parallel is True
+    assert args.euv_exact is False
+    assert args.euv_projection_threads == 8

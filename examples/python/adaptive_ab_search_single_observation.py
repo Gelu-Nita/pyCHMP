@@ -9,6 +9,8 @@ selections for EUV/UV slices.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import math
 import queue
 import hashlib
@@ -26,7 +28,7 @@ from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 from astropy.io import fits
@@ -94,8 +96,20 @@ def _build_run_history_entry(
     }
 
 
-def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int | None:
-    """Return an existing pychmp-view PID for this artifact, if visible."""
+class _ViewerLaunchDecision(NamedTuple):
+    """What ``--viewer`` should do for one artifact.
+
+    ``running`` and ``reuse`` mean a viewer is already open, so the caller
+    must not start another process. ``launch`` means no open window was found.
+    """
+
+    action: str
+    pid: int | None = None
+    focused: bool = False
+
+
+def _find_existing_viewer_pids(*, viewer_script: Path, artifact_h5: Path) -> list[int]:
+    """Return pychmp-view PIDs whose command line includes this artifact."""
     try:
         artifact_text = str(Path(artifact_h5).expanduser().resolve())
         script_name = Path(viewer_script).name
@@ -107,10 +121,11 @@ def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int 
             timeout=2.0,
         )
     except Exception:
-        return None
+        return []
     if proc.returncode != 0:
-        return None
+        return []
     current_pid = os.getpid()
+    found: list[int] = []
     for line in proc.stdout.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -123,19 +138,245 @@ def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int 
         if pid == current_pid:
             continue
         if script_name in command and artifact_text in command:
-            return pid
+            found.append(pid)
+    return found
+
+
+def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int | None:
+    """Return an existing pychmp-view PID for this artifact, if any."""
+    found = _find_existing_viewer_pids(viewer_script=viewer_script, artifact_h5=artifact_h5)
+    if not found:
+        return None
+    return found[0]
+
+
+def _viewer_window_title(artifact_h5: Path) -> str:
+    return f"pychmp-view: {Path(artifact_h5).name}"
+
+
+def _x11_window_name_matches_artifact(window_name: str, artifact_h5: Path) -> bool:
+    """True when an X11 window title is this artifact's pychmp-view window."""
+    expected = _viewer_window_title(artifact_h5)
+    text = str(window_name or "").strip()
+    return text == expected or text.startswith(expected + " ")
+
+
+_X11_ERROR_HANDLER = None
+
+
+def _load_x11_library() -> Any | None:
+    cached = getattr(_load_x11_library, "_library", None)
+    if cached is not None:
+        return cached
+    candidates: list[str] = []
+    found = ctypes.util.find_library("X11")
+    if found:
+        candidates.append(found)
+    candidates.extend(
+        [
+            "/opt/X11/lib/libX11.dylib",
+            "libX11.so.6",
+            "libX11.so",
+        ]
+    )
+    for name in candidates:
+        try:
+            library = ctypes.cdll.LoadLibrary(name)
+        except OSError:
+            continue
+        library.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        library.XOpenDisplay.restype = ctypes.c_void_p
+        library.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        library.XCloseDisplay.restype = ctypes.c_int
+        library.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        library.XDefaultRootWindow.restype = ctypes.c_ulong
+        library.XQueryTree.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        library.XQueryTree.restype = ctypes.c_int
+        library.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)]
+        library.XFetchName.restype = ctypes.c_int
+        library.XFree.argtypes = [ctypes.c_void_p]
+        library.XFree.restype = ctypes.c_int
+        library.XMapRaised.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        library.XMapRaised.restype = ctypes.c_int
+        library.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        library.XRaiseWindow.restype = ctypes.c_int
+        library.XFlush.argtypes = [ctypes.c_void_p]
+        library.XFlush.restype = ctypes.c_int
+        library.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        library.XSync.restype = ctypes.c_int
+        handler_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        library.XSetErrorHandler.argtypes = [handler_type]
+        library.XSetErrorHandler.restype = ctypes.c_void_p
+        global _X11_ERROR_HANDLER
+        if _X11_ERROR_HANDLER is None:
+            def _ignore_x_error(_display: Any, _event: Any) -> int:
+                return 0
+
+            _X11_ERROR_HANDLER = handler_type(_ignore_x_error)
+        library.XSetErrorHandler(_X11_ERROR_HANDLER)
+        _load_x11_library._library = library  # type: ignore[attr-defined]
+        return library
     return None
 
 
-def _focus_existing_viewer_pid(pid: int) -> bool:
-    """Try to bring an existing pychmp-view process to the foreground."""
+def _walk_x11_windows(library: Any, display: Any, root: int) -> list[tuple[int, str]]:
+    named: list[tuple[int, str]] = []
+    pending = [int(root)]
+    seen = 0
+    while pending and seen < 4000:
+        window = pending.pop()
+        root_return = ctypes.c_ulong()
+        parent_return = ctypes.c_ulong()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        count = ctypes.c_uint()
+        status = library.XQueryTree(
+            display,
+            ctypes.c_ulong(window),
+            ctypes.byref(root_return),
+            ctypes.byref(parent_return),
+            ctypes.byref(children),
+            ctypes.byref(count),
+        )
+        if not status:
+            continue
+        child_ids = [int(children[index]) for index in range(int(count.value))]
+        if child_ids:
+            library.XFree(ctypes.cast(children, ctypes.c_void_p))
+        for child in child_ids:
+            seen += 1
+            pending.append(child)
+            name_pointer = ctypes.c_char_p()
+            fetched = library.XFetchName(display, ctypes.c_ulong(child), ctypes.byref(name_pointer))
+            if fetched and name_pointer.value:
+                named.append((child, name_pointer.value.decode("utf-8", "replace")))
+                library.XFree(ctypes.cast(name_pointer, ctypes.c_void_p))
+    return named
+
+
+def _query_open_viewer_windows(artifact_h5: Path) -> tuple[bool, list[int]]:
+    """Return ``(display_queried, window_ids)`` for this artifact's viewer.
+
+    A queried display with an empty list means the viewer window is not open.
+    ``display_queried`` is false when X11 cannot be asked.
+    """
+    library = _load_x11_library()
+    if library is None:
+        return False, []
+    display = library.XOpenDisplay(None)
+    if not display:
+        return False, []
+    try:
+        root = int(library.XDefaultRootWindow(display))
+        matches = [
+            window_id
+            for window_id, name in _walk_x11_windows(library, display, root)
+            if _x11_window_name_matches_artifact(name, artifact_h5)
+        ]
+        return True, matches
+    except Exception:
+        return False, []
+    finally:
+        try:
+            library.XCloseDisplay(display)
+        except Exception:
+            pass
+
+
+def _raise_open_viewer_windows(window_ids: list[int]) -> bool:
+    """Map and raise viewer X windows, including iconic (hidden) ones."""
+    if not window_ids:
+        return False
+    library = _load_x11_library()
+    if library is None:
+        return False
+    display = library.XOpenDisplay(None)
+    if not display:
+        return False
+    try:
+        for window_id in window_ids:
+            library.XMapRaised(display, ctypes.c_ulong(int(window_id)))
+            library.XRaiseWindow(display, ctypes.c_ulong(int(window_id)))
+        library.XFlush(display)
+        library.XSync(display, False)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            library.XCloseDisplay(display)
+        except Exception:
+            pass
+
+
+def _osascript_show_viewer(pid: int, *, unhide_xquartz: bool) -> bool:
+    """Unhide a Mac viewer process and, for XQuartz, the X11 application."""
     if not sys.platform.startswith("darwin"):
         return False
-    script = (
-        'tell application "System Events"\n'
-        f"set frontmost of first process whose unix id is {int(pid)} to true\n"
-        "end tell"
-    )
+    lines = []
+    if unhide_xquartz:
+        lines.extend(
+            [
+                "try",
+                'tell application "XQuartz" to activate',
+                "end try",
+            ]
+        )
+    lines.append('tell application "System Events"')
+    if int(pid) > 1:
+        lines.extend(
+            [
+                "try",
+                f"set targetProc to first process whose unix id is {int(pid)}",
+                "try",
+                "set visible of targetProc to true",
+                "end try",
+                "try",
+                "set frontmost of targetProc to true",
+                "end try",
+                "try",
+                "repeat with w in windows of targetProc",
+                "try",
+                'set value of attribute "AXMinimized" of w to false',
+                "end try",
+                "end repeat",
+                "end try",
+                "end try",
+            ]
+        )
+    if unhide_xquartz:
+        lines.extend(
+            [
+                "repeat with appName in {\"XQuartz\", \"X11.bin\", \"X11\"}",
+                "try",
+                "set xProc to first process whose name is appName",
+                "try",
+                "set visible of xProc to true",
+                "end try",
+                "try",
+                "set frontmost of xProc to true",
+                "end try",
+                "try",
+                "repeat with w in windows of xProc",
+                "try",
+                'set value of attribute "AXMinimized" of w to false',
+                "end try",
+                "end repeat",
+                "end try",
+                "end try",
+                "end repeat",
+            ]
+        )
+    lines.append("end tell")
+    if len(lines) <= 2 and not unhide_xquartz:
+        return False
+    script = "\n".join(lines)
     try:
         proc = subprocess.run(
             ["osascript", "-e", script],
@@ -147,6 +388,225 @@ def _focus_existing_viewer_pid(pid: int) -> bool:
     except Exception:
         return False
     return proc.returncode == 0
+
+
+def _cocoa_bounds_are_viewer_window(width: float, height: float, layer: int) -> bool:
+    """True for a main viewer window, not a menu bar or a small popup."""
+    return int(layer) == 0 and float(width) >= 400.0 and float(height) >= 300.0
+
+
+def _cocoa_viewer_owner_pids(candidate_pids: list[int]) -> tuple[bool, list[int]]:
+    """Return ``(queried, pids)`` for Aqua Tk windows owned by these processes."""
+    if not sys.platform.startswith("darwin") or not candidate_pids:
+        return False, []
+    wanted = {int(pid) for pid in candidate_pids}
+    try:
+        core_graphics = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        core_foundation = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    except OSError:
+        return False, []
+    core_graphics.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    core_graphics.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+    core_foundation.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    core_foundation.CFArrayGetCount.restype = ctypes.c_long
+    core_foundation.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    core_foundation.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+    core_foundation.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    core_foundation.CFDictionaryGetValue.restype = ctypes.c_void_p
+    core_foundation.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    core_foundation.CFNumberGetValue.restype = ctypes.c_bool
+    core_foundation.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    core_foundation.CFStringCreateWithCString.restype = ctypes.c_void_p
+    core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    try:
+        pid_key = ctypes.c_void_p.in_dll(core_graphics, "kCGWindowOwnerPID")
+        bounds_key = ctypes.c_void_p.in_dll(core_graphics, "kCGWindowBounds")
+        layer_key = ctypes.c_void_p.in_dll(core_graphics, "kCGWindowLayer")
+    except ValueError:
+        return False, []
+    array = core_graphics.CGWindowListCopyWindowInfo(0, 0)
+    if not array:
+        return False, []
+    created_keys: list[Any] = []
+    try:
+        def _make_key(text: str) -> Any:
+            value = core_foundation.CFStringCreateWithCString(None, text.encode(), 0x08000100)
+            created_keys.append(value)
+            return value
+
+        key_w = _make_key("Width")
+        key_h = _make_key("Height")
+
+        def _number(value: Any) -> float | None:
+            if not value:
+                return None
+            as_float = ctypes.c_double()
+            if core_foundation.CFNumberGetValue(value, 13, ctypes.byref(as_float)):
+                return float(as_float.value)
+            return None
+
+        owners: set[int] = set()
+        count = int(core_foundation.CFArrayGetCount(array))
+        for index in range(count):
+            item = core_foundation.CFArrayGetValueAtIndex(array, index)
+            pid_value = _number(core_foundation.CFDictionaryGetValue(item, pid_key))
+            if pid_value is None or int(pid_value) not in wanted:
+                continue
+            bounds = core_foundation.CFDictionaryGetValue(item, bounds_key)
+            if not bounds:
+                continue
+            width = _number(core_foundation.CFDictionaryGetValue(bounds, key_w))
+            height = _number(core_foundation.CFDictionaryGetValue(bounds, key_h))
+            layer = _number(core_foundation.CFDictionaryGetValue(item, layer_key))
+            if width is None or height is None or layer is None:
+                continue
+            if _cocoa_bounds_are_viewer_window(width, height, int(layer)):
+                owners.add(int(pid_value))
+        return True, sorted(owners)
+    except Exception:
+        return False, []
+    finally:
+        for value in created_keys:
+            try:
+                core_foundation.CFRelease(value)
+            except Exception:
+                pass
+        try:
+            core_foundation.CFRelease(array)
+        except Exception:
+            pass
+
+
+def _activate_cocoa_viewer_pid(pid: int) -> bool:
+    """Unhide and activate an Aqua viewer, including a minimized window."""
+    if not sys.platform.startswith("darwin") or int(pid) <= 1:
+        return False
+    try:
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+    except OSError:
+        return False
+    objc.objc_getClass.argtypes = [ctypes.c_char_p]
+    objc.objc_getClass.restype = ctypes.c_void_p
+    objc.sel_registerName.argtypes = [ctypes.c_char_p]
+    objc.sel_registerName.restype = ctypes.c_void_p
+    runtime_class = objc.objc_getClass(b"NSRunningApplication")
+    if not runtime_class:
+        return False
+    try:
+        lookup = ctypes.cast(
+            objc.objc_msgSend,
+            ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int),
+        )
+        application = lookup(
+            runtime_class,
+            objc.sel_registerName(b"runningApplicationWithProcessIdentifier:"),
+            int(pid),
+        )
+        if not application:
+            return False
+        void_send = ctypes.cast(
+            objc.objc_msgSend,
+            ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p),
+        )
+        void_send(application, objc.sel_registerName(b"unhide"))
+        activate = ctypes.cast(
+            objc.objc_msgSend,
+            ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulonglong),
+        )
+        # NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps
+        return bool(activate(application, objc.sel_registerName(b"activateWithOptions:"), 3))
+    except Exception:
+        return False
+
+
+def _viewer_window_owner_pids(candidate_pids: list[int], artifact_h5: Path) -> tuple[bool, list[int]]:
+    """Return ``(windows_queried, pids)`` that currently show this artifact.
+
+    On this Mac the viewer is Aqua Tk, so CoreGraphics is authoritative.
+    X11 titles are the fallback when that list cannot be read.
+    """
+    cocoa_queried, cocoa_pids = _cocoa_viewer_owner_pids(candidate_pids)
+    if cocoa_queried:
+        return True, list(cocoa_pids)
+    try:
+        x11_queried, x11_windows = _query_open_viewer_windows(artifact_h5)
+    except Exception:
+        x11_queried, x11_windows = False, []
+    if not x11_queried:
+        return False, []
+    if x11_windows and candidate_pids:
+        return True, [max(int(pid) for pid in candidate_pids)]
+    return True, []
+
+
+def _focus_existing_viewer_pid(pid: int, *, artifact_h5: Path | None = None) -> bool:
+    """Bring an existing viewer forward, including a hidden or minimized window."""
+    cocoa_shown = False
+    if sys.platform.startswith("darwin") and int(pid) > 1:
+        try:
+            cocoa_shown = _activate_cocoa_viewer_pid(int(pid))
+        except Exception:
+            cocoa_shown = False
+    x11_shown = False
+    if artifact_h5 is not None:
+        try:
+            _queried, window_ids = _query_open_viewer_windows(artifact_h5)
+        except Exception:
+            window_ids = []
+        if window_ids:
+            try:
+                x11_shown = _raise_open_viewer_windows(window_ids)
+            except Exception:
+                x11_shown = False
+    if not sys.platform.startswith("darwin"):
+        return bool(x11_shown)
+    if cocoa_shown:
+        return True
+    script_shown = _osascript_show_viewer(int(pid), unhide_xquartz=x11_shown)
+    return bool(script_shown or x11_shown)
+
+
+def _decide_viewer_launch(
+    *,
+    viewer_script: Path,
+    artifact_h5: Path,
+    viewer_process: subprocess.Popen[Any] | None = None,
+) -> _ViewerLaunchDecision:
+    """Decide whether ``--viewer`` may start a new pychmp-view.
+
+    One open window for the artifact blocks another launch. The existing
+    window is brought forward when it is hidden. A process left behind after
+    its window was closed does not block a launch when the display can be
+    queried and shows no viewer window. When the display cannot be queried,
+    a matching process still blocks a second launch.
+    """
+    if viewer_process is not None and viewer_process.poll() is None:
+        focused = False
+        try:
+            focused = _focus_existing_viewer_pid(int(viewer_process.pid), artifact_h5=artifact_h5)
+        except Exception:
+            focused = False
+        return _ViewerLaunchDecision("running", int(viewer_process.pid), focused)
+
+    existing_pids = _find_existing_viewer_pids(viewer_script=viewer_script, artifact_h5=artifact_h5)
+    try:
+        queried, open_pids = _viewer_window_owner_pids(existing_pids, artifact_h5)
+    except Exception:
+        queried, open_pids = False, []
+    if open_pids:
+        existing_pid = max(int(pid) for pid in open_pids)
+    elif (not queried) and existing_pids:
+        existing_pid = max(existing_pids)
+    else:
+        return _ViewerLaunchDecision("launch", None, False)
+
+    focused = False
+    try:
+        focused = _focus_existing_viewer_pid(int(existing_pid), artifact_h5=artifact_h5)
+    except Exception:
+        focused = False
+    return _ViewerLaunchDecision("reuse", int(existing_pid), focused)
 
 
 def _is_hdf5_lock_contention_error(exc: BaseException) -> bool:
@@ -211,6 +671,7 @@ from pychmp import (
     obs_map_noise_unit_label,
     prepare_observation_for_metrics,
     resolve_geometry_policy,
+    resolve_renderer_observer_name,
     resolve_slice_observation_reference,
     SliceObservationReference,
     SliceObservationReferenceError,
@@ -219,11 +680,13 @@ from pychmp import (
     compute_forward_model_identity_placeholder,
     resolve_default_testdata_fixture_paths,
     ExpandResumeContext,
+    drain_incomplete_resume_points,
     search_local_minimum_ab,
     select_expand_frontier_seed,
     widened_boundary_axes,
     validate_obs_map_identity,
 )
+from pychmp.ab_search import point_search_spectral_label
 from pychmp.search_options import add_chmp_search_cli_arguments, resolve_chmp_search_settings, resolve_shift_policy_from_args
 from pychmp.render_obs_fits_dir import (
     build_render_obs_target_context,
@@ -271,6 +734,7 @@ from pychmp.ab_scan_artifacts import (
     assert_expand_grid_search_cli_argv_allowed,
     assert_recompute_search_cli_argv_allowed,
     load_search_run_profile,
+    validate_pinned_search_evaluation_recipe,
     parse_expand_grid_bounds_from_argv,
     validate_expanded_ab_bounds,
     matching_search_id_for_slice,
@@ -368,48 +832,52 @@ def _load_slice_psf_metadata_from_artifact(*, artifact_h5: Path, slice_key: str)
     except Exception:
         return None
 
+    def _metadata_from_common(common: Any) -> PSFMetadata | None:
+        if "psf_kernel" in common:
+            kernel = np.asarray(common["psf_kernel"], dtype=float)
+            if kernel.ndim == 2 and kernel.size > 0:
+                source = "artifact_slice_psf"
+                if "psf_kernel_meta_json" in common:
+                    try:
+                        raw_meta = common["psf_kernel_meta_json"][()]
+                        if isinstance(raw_meta, bytes):
+                            raw_meta = raw_meta.decode("utf-8", errors="replace")
+                        parsed = json.loads(str(raw_meta))
+                        origin_source = str(parsed.get("source") or "").strip()
+                        if origin_source:
+                            source = f"artifact_slice_psf:{origin_source}"
+                    except Exception:
+                        pass
+                return PSFMetadata(
+                    source=source,
+                    kind="kernel",
+                    kernel=kernel,
+                    allows_frequency_scaling=False,
+                )
+        if "diagnostics_json" in common:
+            try:
+                raw_diag = common["diagnostics_json"][()]
+                if isinstance(raw_diag, bytes):
+                    raw_diag = raw_diag.decode("utf-8", errors="replace")
+                diagnostics = json.loads(str(raw_diag))
+                if isinstance(diagnostics, dict):
+                    from pychmp.psf import psf_metadata_from_diagnostics
+
+                    return psf_metadata_from_diagnostics(diagnostics)
+            except Exception:
+                return None
+        return None
+
     try:
         with h5py.File(str(artifact_h5), "r", locking=False) as f:
             common = f["slices"][str(slice_key)]["common"]
-            if "psf_kernel" not in common:
-                return None
-            kernel = np.asarray(common["psf_kernel"], dtype=float)
-            if kernel.ndim != 2 or kernel.size == 0:
-                return None
-            source = "artifact_slice_psf"
-            if "psf_kernel_meta_json" in common:
-                try:
-                    raw_meta = common["psf_kernel_meta_json"][()]
-                    if isinstance(raw_meta, bytes):
-                        raw_meta = raw_meta.decode("utf-8", errors="replace")
-                    parsed = json.loads(str(raw_meta))
-                    origin_source = str(parsed.get("source") or "").strip()
-                    if origin_source:
-                        source = f"artifact_slice_psf:{origin_source}"
-                except Exception:
-                    pass
-            return PSFMetadata(
-                source=source,
-                kind="kernel",
-                kernel=kernel,
-                allows_frequency_scaling=False,
-            )
+            return _metadata_from_common(common)
     except TypeError:
         # Older h5py versions may not support the locking kwarg.
         try:
             with h5py.File(str(artifact_h5), "r") as f:
                 common = f["slices"][str(slice_key)]["common"]
-                if "psf_kernel" not in common:
-                    return None
-                kernel = np.asarray(common["psf_kernel"], dtype=float)
-                if kernel.ndim != 2 or kernel.size == 0:
-                    return None
-                return PSFMetadata(
-                    source="artifact_slice_psf",
-                    kind="kernel",
-                    kernel=kernel,
-                    allows_frequency_scaling=False,
-                )
+                return _metadata_from_common(common)
         except Exception:
             return None
     except Exception:
@@ -423,6 +891,10 @@ def _load_slice_preflight_payload(
     include_maps: bool = False,
     search_id: str | None = None,
 ) -> dict[str, Any] | None:
+    # Slice-common diagnostics may still describe an auxiliary render placeholder.
+    # The selected search owns the scoring recipe, including PSF provenance.
+    if search_id is None and artifact_h5.exists():
+        search_id = read_slice_active_search_id(artifact_h5, slice_key=slice_key)
     try:
         payload = load_slice_observation_reference_payload(
             artifact_h5,
@@ -468,6 +940,13 @@ def _load_slice_preflight_payload(
         return None
     obs_diagnostics = dict(payload.get("diagnostics") or {})
     merged_diagnostics = {**common_diagnostics, **obs_diagnostics}
+    if search_id:
+        profile = load_search_run_profile(artifact_h5, search_id=search_id)
+        merged_diagnostics.update(profile["diagnostics"])
+        for key in ("psf_source", "resolved_psf"):
+            if key in profile["request"]:
+                merged_diagnostics[key] = profile["request"][key]
+        merged_diagnostics.pop("render_only_slice", None)
     wcs_header = payload.get("wcs_header")
     if wcs_header is None:
         wcs_header = fits.Header.fromstring(str(header_text), sep="\n")
@@ -917,6 +1396,45 @@ class _TrackedRendererProxy:
             )
         return None
 
+    def _record_cached_render_products(self, q0_value: float) -> None:
+        q0_key = float(q0_value)
+
+        def candidates() -> list[Any]:
+            values = [self._renderer]
+            renderer_base = getattr(self._renderer, "_base", None)
+            if renderer_base is not None:
+                values.append(renderer_base)
+            tracked_base = getattr(self, "_base", None)
+            if tracked_base is not None:
+                values.append(tracked_base)
+            return values
+
+        for candidate in candidates():
+            cache = getattr(candidate, "_components_cache", None)
+            if isinstance(cache, dict):
+                payload = cache.get(q0_key)
+                if payload is not None:
+                    self._stream.record_components(
+                        a_value=self._a_value,
+                        b_value=self._b_value,
+                        q0_value=q0_key,
+                        components=dict(payload),
+                    )
+                    break
+
+        for candidate in candidates():
+            cache = getattr(candidate, "_cube_cache", None)
+            if isinstance(cache, dict):
+                payload = cache.get(q0_key)
+                if payload is not None:
+                    self._stream.record_cube(
+                        a_value=self._a_value,
+                        b_value=self._b_value,
+                        q0_value=q0_key,
+                        cube_payload=dict(payload),
+                    )
+                    break
+
     def render_pair(self, q0: float) -> tuple[np.ndarray, np.ndarray]:
         q0_value = float(q0)
         stored = self._load_stored_render_pair(q0_value)
@@ -947,6 +1465,8 @@ class _TrackedRendererProxy:
             modeled=modeled_arr,
             stokes_v=None if stokes_v is None else np.asarray(stokes_v, dtype=np.float32),
         )
+        if not from_map_store:
+            self._record_cached_render_products(q0_value)
         return raw_arr, modeled_arr
 
     def render(self, q0: float) -> np.ndarray:
@@ -979,6 +1499,8 @@ class _TrackedRendererProxy:
             artifact_h5=getattr(self, "_artifact_h5", None),
             slice_key=getattr(self, "_slice_key", None),
             search_id=getattr(self, "_search_id", None),
+            slice_map_index=getattr(self, "_slice_map_index", None),
+            psf_kernel=getattr(self, "_psf_kernel", None),
         )
 
     def prepare_stored_trial_maps(self) -> int:
@@ -1149,6 +1671,10 @@ class _AdaptiveRendererFactory:
     ebtel_sha256: str = ""
     euv_response_sha256: str | None = None
     euv_response_identity_version: str | None = None
+    euv_parallel: bool = False
+    euv_exact: bool = False
+    euv_projection_threads: int = 0
+    prebuilt_euv_response: Any = None
 
     def __call__(self, a: float, b: float) -> Any:
         sdk = import_module("gxrender.sdk")
@@ -1198,6 +1724,7 @@ class _AdaptiveRendererFactory:
             render_channels=self.render_channels,
             instrument=str(self.euv_instrument or "AIA"),
             response_sav=self.euv_response_sav,
+            prebuilt_response=self.prebuilt_euv_response,
             ebtel_path=self.ebtel_path,
             tbase=float(self.tbase),
             nbase=float(self.nbase),
@@ -1208,6 +1735,9 @@ class _AdaptiveRendererFactory:
             observer_name=self.observer_name,
             tr_region_mask=None if self.tr_region_mask is None else np.asarray(self.tr_region_mask, dtype=bool),
             pixel_scale_arcsec=float(self.pixel_scale_arcsec),
+            parallel=bool(self.euv_parallel),
+            exact=bool(self.euv_exact),
+            projection_threads=int(self.euv_projection_threads),
         )
         if self.psf_kernel is None:
             return base
@@ -1415,6 +1945,12 @@ def _build_synthetic_map_identity(
     channel_or_frequency_label: str,
     component: str,
 ) -> dict[str, Any]:
+    def renderer_attr(name: str, default: str | None = "unknown") -> str | None:
+        value = getattr(renderer_factory, name, default)
+        if value is None:
+            return None
+        return str(value)
+
     return build_map_identity(
         a=float(a_value),
         b=float(b_value),
@@ -1422,13 +1958,39 @@ def _build_synthetic_map_identity(
         domain=str(domain_label),
         channel_or_frequency=str(channel_or_frequency_label),
         component=str(component),
-        forward_model_sha256=str(renderer_factory.forward_model_sha256),
-        forward_model_identity_version=str(renderer_factory.forward_model_identity_version),
-        ebtel_sha256=str(renderer_factory.ebtel_sha256),
-        artifact_geometry_sha256=str(renderer_factory.artifact_geometry_sha256),
-        euv_response_sha256=renderer_factory.euv_response_sha256,
-        euv_response_identity_version=renderer_factory.euv_response_identity_version,
+        forward_model_sha256=renderer_attr("forward_model_sha256") or "unknown",
+        forward_model_identity_version=renderer_attr("forward_model_identity_version") or "unknown",
+        ebtel_sha256=renderer_attr("ebtel_sha256") or "unknown",
+        artifact_geometry_sha256=renderer_attr("artifact_geometry_sha256") or "unknown",
+        euv_response_sha256=renderer_attr("euv_response_sha256", None),
+        euv_response_identity_version=renderer_attr("euv_response_identity_version", None),
+        render_projection={
+            "parallel": bool(getattr(renderer_factory, "euv_parallel", False)),
+            "exact": bool(getattr(renderer_factory, "euv_exact", False)),
+            "nthreads": int(getattr(renderer_factory, "euv_projection_threads", 0)),
+        }
+        if str(domain_label).strip().lower() in {"euv", "uv"}
+        else None,
     )
+
+
+def _normalize_euv_channel_identity_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower().replace("angstrom", "a").replace("å", "a")
+    lowered = lowered.removeprefix("a").strip()
+    for suffix in (" a", "a"):
+        if lowered.endswith(suffix):
+            lowered = lowered[: -len(suffix)].strip()
+    try:
+        numeric = float(lowered)
+    except Exception:
+        return text.strip()
+    rounded = round(numeric)
+    if np.isclose(numeric, float(rounded), rtol=0.0, atol=1e-9):
+        return str(int(rounded))
+    return f"{numeric:.6g}"
 
 
 def _lookup_stream_value_by_q0(
@@ -1563,6 +2125,8 @@ def _point_payload_from_result(
     artifact_h5: Path | None = None,
     slice_key: str | None = None,
     search_id: str | None = None,
+    slice_map_index: Any | None = None,
+    psf_kernel: np.ndarray | None = None,
 ) -> dict[str, Any]:
     point_a = float(point.a)
     point_b = float(point.b)
@@ -1690,7 +2254,8 @@ def _point_payload_from_result(
             euv_coronal_best = np.asarray(corona_target, dtype=np.float32)
         if tr_target is not None:
             euv_tr_best = np.asarray(tr_target, dtype=np.float32)
-        for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+        for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+            channel_label = _normalize_euv_channel_identity_label(channel)
             _register_synthetic_map(
                 identity=_build_synthetic_map_identity(
                     renderer_factory=renderer_factory,
@@ -1698,14 +2263,31 @@ def _point_payload_from_result(
                     b_value=point_b,
                     q0_value=point_q0,
                     domain_label="euv",
-                    channel_or_frequency_label=str(channel),
+                    channel_or_frequency_label=channel_label,
+                    component="stokes_i",
+                ),
+                array=np.asarray(rendered, dtype=np.float32),
+                label=f"EUV {channel_label} rendered",
+                map_role="stokes_i",
+            )
+        for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+            channel_label = _normalize_euv_channel_identity_label(channel)
+            _register_synthetic_map(
+                identity=_build_synthetic_map_identity(
+                    renderer_factory=renderer_factory,
+                    a_value=point_a,
+                    b_value=point_b,
+                    q0_value=point_q0,
+                    domain_label="euv",
+                    channel_or_frequency_label=channel_label,
                     component="corona",
                 ),
                 array=np.asarray(rendered, dtype=np.float32),
-                label=f"EUV {channel} corona",
+                label=f"EUV {channel_label} corona",
                 map_role="corona",
             )
         for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
+            channel_label = _normalize_euv_channel_identity_label(channel)
             _register_synthetic_map(
                 identity=_build_synthetic_map_identity(
                     renderer_factory=renderer_factory,
@@ -1713,11 +2295,11 @@ def _point_payload_from_result(
                     b_value=point_b,
                     q0_value=point_q0,
                     domain_label="euv",
-                    channel_or_frequency_label=str(channel),
+                    channel_or_frequency_label=channel_label,
                     component="tr",
                 ),
                 array=np.asarray(rendered, dtype=np.float32),
-                label=f"EUV {channel} TR",
+                label=f"EUV {channel_label} TR",
                 map_role="tr",
             )
 
@@ -1741,6 +2323,24 @@ def _point_payload_from_result(
         stokes_v_trials: list[np.ndarray] = []
         for trial_index, q0_value in enumerate(trial_q0_values):
             raw_trial = _lookup_stream_value_by_q0(trial_raw_by_q0, q0_value)
+            if raw_trial is None and slice_map_index is not None and artifact_h5 is not None:
+                from pychmp.slice_map_index import load_render_pair_from_index
+
+                pair = load_render_pair_from_index(
+                    Path(artifact_h5),
+                    index=slice_map_index,
+                    a=point_a,
+                    b=point_b,
+                    q0=float(q0_value),
+                    observed_template=np.asarray(observed_template, dtype=float),
+                    psf_kernel=psf_kernel,
+                )
+                if pair is not None:
+                    raw_trial_arr, modeled_trial_arr = pair
+                    key = _PointRenderStream._q0_key(float(q0_value))
+                    trial_raw_by_q0[key] = np.asarray(raw_trial_arr, dtype=np.float32)
+                    trial_modeled_by_q0[key] = np.asarray(modeled_trial_arr, dtype=np.float32)
+                    raw_trial = raw_trial_arr
             if raw_trial is None:
                 continue
             raw_trial_arr = np.asarray(raw_trial, dtype=np.float32)
@@ -1762,7 +2362,8 @@ def _point_payload_from_result(
                     if coronal is not None and tr_flux is not None:
                         euv_coronal_trials.append(np.asarray(coronal, dtype=np.float32))
                         euv_tr_trials.append(np.asarray(tr_flux, dtype=np.float32))
-                    for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+                    for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+                        channel_label = _normalize_euv_channel_identity_label(channel)
                         _register_synthetic_map(
                             identity=_build_synthetic_map_identity(
                                 renderer_factory=renderer_factory,
@@ -1770,14 +2371,31 @@ def _point_payload_from_result(
                                 b_value=point_b,
                                 q0_value=float(q0_value),
                                 domain_label="euv",
-                                channel_or_frequency_label=str(channel),
+                                channel_or_frequency_label=channel_label,
+                                component="stokes_i",
+                            ),
+                            array=np.asarray(rendered, dtype=np.float32),
+                            label=f"EUV {channel_label} trial {trial_index:03d} rendered",
+                            map_role=f"trial_{trial_index:03d}_stokes_i",
+                        )
+                    for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+                        channel_label = _normalize_euv_channel_identity_label(channel)
+                        _register_synthetic_map(
+                            identity=_build_synthetic_map_identity(
+                                renderer_factory=renderer_factory,
+                                a_value=point_a,
+                                b_value=point_b,
+                                q0_value=float(q0_value),
+                                domain_label="euv",
+                                channel_or_frequency_label=channel_label,
                                 component="corona",
                             ),
                             array=np.asarray(rendered, dtype=np.float32),
-                            label=f"EUV {channel} trial {trial_index:03d} corona",
+                            label=f"EUV {channel_label} trial {trial_index:03d} corona",
                             map_role=f"trial_{trial_index:03d}_corona",
                         )
                     for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
+                        channel_label = _normalize_euv_channel_identity_label(channel)
                         _register_synthetic_map(
                             identity=_build_synthetic_map_identity(
                                 renderer_factory=renderer_factory,
@@ -1785,11 +2403,11 @@ def _point_payload_from_result(
                                 b_value=point_b,
                                 q0_value=float(q0_value),
                                 domain_label="euv",
-                                channel_or_frequency_label=str(channel),
+                                channel_or_frequency_label=channel_label,
                                 component="tr",
                             ),
                             array=np.asarray(rendered, dtype=np.float32),
-                            label=f"EUV {channel} trial {trial_index:03d} TR",
+                            label=f"EUV {channel_label} trial {trial_index:03d} TR",
                             map_role=f"trial_{trial_index:03d}_tr",
                         )
                 trial_cube = _lookup_stream_value_by_q0(stream_record.cube_by_q0, q0_value)
@@ -2243,6 +2861,53 @@ def _target_metric_value(metrics: Any, target_metric: str) -> float:
     raise ValueError(f"unsupported target metric: {target_metric!r}")
 
 
+def _warm_mask_type_kwargs_from_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    explicit_mask: np.ndarray | None = None,
+) -> dict[str, Any]:
+    return {
+        "q0_search_stages": diagnostics.get("q0_search_stages"),
+        "mask_type": str(diagnostics.get("mask_type", "union")),
+        "explicit_mask": explicit_mask,
+    }
+
+
+def _warm_bracket_seed_mask_type_from_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    explicit_mask: np.ndarray | None = None,
+) -> str:
+    from pychmp.q0_search import resolve_warm_bracket_seed_mask_type
+
+    return resolve_warm_bracket_seed_mask_type(
+        **_warm_mask_type_kwargs_from_diagnostics(diagnostics, explicit_mask=explicit_mask)
+    )
+
+
+def _warm_curve_rescore_mask_type_from_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    explicit_mask: np.ndarray | None = None,
+) -> str:
+    from pychmp.q0_search import resolve_warm_curve_rescore_mask_type
+
+    return resolve_warm_curve_rescore_mask_type(
+        **_warm_mask_type_kwargs_from_diagnostics(diagnostics, explicit_mask=explicit_mask)
+    )
+
+
+def _warm_rescore_mask_type_from_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    explicit_mask: np.ndarray | None = None,
+) -> str:
+    return _warm_bracket_seed_mask_type_from_diagnostics(
+        diagnostics,
+        explicit_mask=explicit_mask,
+    )
+
+
 def _rescore_record_to_warm_initial_evaluations(
     record: dict[str, Any],
     *,
@@ -2253,6 +2918,7 @@ def _rescore_record_to_warm_initial_evaluations(
     target_metric: str,
     psf_kernel: np.ndarray | None = None,
     evaluation_context: ObservationEvaluationContext | None = None,
+    mask_type: str = "union",
 ) -> dict[float, Q0MetricEvaluation] | None:
     """Rescore stored trial maps for warm-start q0 search (IDL policy); no point commit."""
     from pychmp.chmp_evaluation import ObservationEvaluationContext, evaluate_modeled_trial
@@ -2297,7 +2963,7 @@ def _rescore_record_to_warm_initial_evaluations(
             modeled_arr,
             evaluation_context,
             threshold=float(threshold),
-            mask_type="union",
+            mask_type=str(mask_type),
             explicit_mask=explicit_mask,
             use_emthreshold=True,
         )
@@ -2320,6 +2986,7 @@ def _rescore_auxiliary_map_record(
     target_metric: str,
     psf_kernel: np.ndarray | None = None,
     tr_region_mask: np.ndarray | None = None,
+    mask_type: str = "union",
 ) -> tuple[ABPointResult, dict[str, Any]] | None:
     if record.get("euv_tr_mask") is None and tr_region_mask is not None:
         record = {**dict(record), "euv_tr_mask": np.asarray(tr_region_mask, dtype=bool)}
@@ -2333,7 +3000,7 @@ def _rescore_auxiliary_map_record(
     observed_arr = np.asarray(observed, dtype=float)
     sigma_arr = np.asarray(sigma_map, dtype=float)
     explicit_mask_arr = None if explicit_mask is None else np.asarray(explicit_mask, dtype=bool)
-    mask_fn = resolve_threshold_mask("union")
+    mask_fn = resolve_threshold_mask(str(mask_type))
 
     if trial_maps_raw is None:
         diagnostics = dict(record.get("diagnostics") or {})
@@ -2537,6 +3204,37 @@ def _pinned_search_id(args: argparse.Namespace) -> str:
     return _normalized_recompute_search_id(args) or _normalized_expand_grid_search_id(args)
 
 
+def _matching_search_is_finished(
+    artifact_h5: Path, *, slice_key: str, search_id: str,
+    diagnostics: dict[str, Any],
+) -> bool:
+    """Recognize a finished run without loading maps or replaying the optimizer.
+
+    Evaluation identity is checked by the caller. Adaptive bounds and seed are
+    deliberately outside that identity, so require those to match as well.
+    """
+    import h5py
+
+    with h5py.File(artifact_h5, "r") as f:
+        search = f[SLICE_CONTAINER_GROUP][slice_key][SEARCHES_GROUP][search_id]
+        stored = json.loads(search["diagnostics_json"][()])
+        lifecycle = json.loads(search["lifecycle_json"][()]) if "lifecycle_json" in search else {}
+        if (lifecycle.get("status") != "complete" or lifecycle.get("active")
+                or not lifecycle.get("completed_at")):
+            return False
+        for key in ("search_mode", "a_start", "b_start", "da", "db", "a_range", "b_range"):
+            if key not in stored or stored[key] != diagnostics.get(key):
+                return False
+        points = search.get(GRID_POINTS_GROUP)
+        if points is None or not len(points):
+            return False
+        return all(
+            not grid_point_storage_corrupt(point)
+            and classify_grid_point_state(read_grid_point_header(point)) == "complete"
+            for point in points.values()
+        )
+
+
 def _preserve_stored_search_trials_requested(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "preserve_stored_search_trials", False))
 
@@ -2664,6 +3362,101 @@ def _configure_expand_grid_search(args: argparse.Namespace) -> str | None:
     return expand_search_id
 
 
+_EXPAND_BOUND_FLAG_BY_AXIS: dict[str, str] = {
+    "a_min": "--a-min",
+    "a_max": "--a-max",
+    "b_min": "--b-min",
+    "b_max": "--b-max",
+}
+
+
+def _suggested_expand_bound_tokens(
+    *,
+    axes: tuple[str, ...],
+    a_min: float,
+    a_max: float,
+    b_min: float,
+    b_max: float,
+    da: float,
+    db: float,
+) -> list[str]:
+    """Example widened bound argv tokens for uncertified-basin guidance."""
+    suggestions: list[str] = []
+    for axis in axes:
+        flag = _EXPAND_BOUND_FLAG_BY_AXIS.get(str(axis))
+        if flag is None:
+            continue
+        if axis == "a_min":
+            value = float(a_min) - float(da)
+        elif axis == "a_max":
+            value = float(a_max) + float(da)
+        elif axis == "b_min":
+            value = float(b_min) - float(db)
+        elif axis == "b_max":
+            value = float(b_max) + float(db)
+        else:
+            continue
+        suggestions.extend([flag, f"{value:g}"])
+    return suggestions
+
+
+def format_uncertified_basin_expand_guidance(
+    *,
+    artifact_h5: Path | str,
+    search_id: str,
+    a_min: float,
+    a_max: float,
+    b_min: float,
+    b_max: float,
+    da: float,
+    db: float,
+    boundary_axes: tuple[str, ...] = (),
+    frontier_open_axes: tuple[str, ...] = (),
+) -> str:
+    """User-facing hint for widening a completed search via --expand-grid-search-id."""
+    artifact_path = Path(artifact_h5).expanduser()
+    search_id_text = str(search_id or "").strip() or "<search_id>"
+    hint_axes = tuple(frontier_open_axes or boundary_axes)
+    bound_tokens = _suggested_expand_bound_tokens(
+        axes=hint_axes,
+        a_min=float(a_min),
+        a_max=float(a_max),
+        b_min=float(b_min),
+        b_max=float(b_max),
+        da=float(da),
+        db=float(db),
+    )
+    if not bound_tokens:
+        bound_tokens = ["--a-min", f"{float(a_min) - float(da):g}"]
+
+    command_lines = [
+        "  python examples/python/adaptive_ab_search_single_observation.py \\",
+        f"    --artifact-h5 {artifact_path} \\",
+        f"    --expand-grid-search-id {search_id_text} \\",
+    ]
+    for index in range(0, len(bound_tokens), 2):
+        flag = bound_tokens[index]
+        value = bound_tokens[index + 1]
+        suffix = " \\" if index + 2 < len(bound_tokens) else " \\"
+        command_lines.append(f"    {flag} {value}{suffix}")
+    command_lines.append("    --no-viewer")
+
+    lines = [
+        "WARNING: this run did not certify a closed local-minimum basin around the best point.",
+        "Do not re-run a normal adaptive command with updated --a-min/--b-min; that does not expand",
+        "the completed search in place and may re-render or register a parallel search.",
+        "",
+        "Widen the stored footprint with expand mode only (recipe + completed cells preserved):",
+        *command_lines,
+        "",
+        "Allowed with --expand-grid-search-id: --artifact-h5, widened --a-min/--a-max/--b-min/--b-max,",
+        "and optional --no-viewer / --dry-run. Shell launchers that support pinned expand accept the same flags.",
+        f"Search id: {search_id_text}",
+        f"Artifact: {artifact_path}",
+    ]
+    return "\n".join(lines)
+
+
 def _diag_optional_float(diagnostics: dict[str, Any], key: str, default: float) -> float:
     value = diagnostics.get(key, default)
     if value is None:
@@ -2742,10 +3535,14 @@ def _preload_search_cache_from_artifact(
             "Map-store warm preload: slice index ready "
             "(per-point rescore at grid point start; no full-artifact rescore)"
         )
+    if hydrate_completed_points and getattr(cache, "_preserve_stored_search_trials", False):
+        # Matching searches already own their scores. Missing/new points can use
+        # the map-store index lazily, when the adaptive walk actually needs them.
+        return hydrated, 0, 0, 0
     promoted_index = 0
     promoted_same_slice = 0
     promoted_auxiliary = 0
-    if hydrate_completed_points is False and getattr(cache, "_slice_map_index", None) is not None:
+    if getattr(cache, "_slice_map_index", None) is not None:
         promoted_index = cache.count_indexed_warm_points_from_index()
     else:
         promoted_same_slice = cache.promote_current_slice_trial_maps(
@@ -2869,13 +3666,21 @@ def _grid_trial_shift_commit_kwargs(
     shift_x_trials: Any = None,
     shift_y_trials: Any = None,
     shift_valid_trials: Any = None,
+    mask_stage_trials: Any = None,
 ) -> dict[str, Any]:
+    stage = ""
+    if mask_stage_trials is not None:
+        stage_values = list(mask_stage_trials)
+        idx = int(trial_index)
+        if 0 <= idx < len(stage_values):
+            stage = str(stage_values[idx] or "").strip()
     stages: tuple[str, ...] = ()
-    if payload is not None:
+    if not stage and payload is not None:
         stages = tuple(str(v) for v in payload.get("fit_trial_mask_stages", ()) or ())
     if not stages and result is not None:
         stages = tuple(str(v) for v in result.trial_mask_stages or ())
-    stage = str(stages[trial_index]) if trial_index < len(stages) else ""
+    if not stage:
+        stage = str(stages[trial_index]) if trial_index < len(stages) else ""
     if shift_x_trials is None:
         shift_x_trials = payload.get("fit_shift_x_trials") if payload is not None else None
         if shift_x_trials is None and result is not None:
@@ -2952,6 +3757,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             viewer_heartbeat=self._viewer_heartbeat,
         )
         self._point_map: dict[tuple[float, float], ABPointResult] = {}
+        self._partial_point_map: dict[tuple[float, float], ABPointResult] = {}
         self._point_ids: dict[tuple[float, float], str] = {}
         self._trials_committed: dict[tuple[float, float], int] = {}
         self._resume_q0: dict[tuple[float, float], float] = {}
@@ -2964,6 +3770,98 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
 
     def set_preserve_stored_search_trials(self, enabled: bool) -> None:
         self._preserve_stored_search_trials = bool(enabled)
+
+    def _warm_bracket_seed_mask_type(self) -> str:
+        return _warm_bracket_seed_mask_type_from_diagnostics(
+            self._diagnostics,
+            explicit_mask=self._explicit_metric_mask,
+        )
+
+    def _warm_curve_rescore_mask_type(self) -> str:
+        return _warm_curve_rescore_mask_type_from_diagnostics(
+            self._diagnostics,
+            explicit_mask=self._explicit_metric_mask,
+        )
+
+    def _warm_rescore_mask_type(self) -> str:
+        return self._warm_bracket_seed_mask_type()
+
+    def _needs_curve_metric_rescore(self) -> bool:
+        return self.defer_warm_curve_commits()
+
+    def defer_warm_curve_commits(self) -> bool:
+        from pychmp.q0_search import defer_warm_curve_commits
+
+        return defer_warm_curve_commits(
+            q0_search_stages=self._diagnostics.get("q0_search_stages"),
+            mask_type=str(self._diagnostics.get("mask_type", "union")),
+            explicit_mask=self._explicit_metric_mask,
+        )
+
+    def map_store_trial_count_for_point(self, a_value: float, b_value: float) -> int:
+        if self._slice_map_index is None:
+            return 0
+        return len(self._slice_map_index.q0_values(float(a_value), float(b_value)))
+
+    def _rescore_raw_map_for_curve(self, raw_map: np.ndarray) -> Q0MetricEvaluation | None:
+        from pychmp.warm_q0 import rescore_raw_modeled_map
+
+        return rescore_raw_modeled_map(
+            np.asarray(raw_map, dtype=float),
+            observed_template=np.asarray(self._observed, dtype=float),
+            psf_kernel=self._psf_kernel,
+            context=self._warm_evaluation_context(),
+            threshold=float(self._diagnostics.get("metrics_mask_threshold", 0.1)),
+            explicit_mask=self._explicit_metric_mask,
+            target_metric=self._target_metric,
+            use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
+            mask_type=self._warm_curve_rescore_mask_type(),
+        )
+
+    def _curve_commit_metrics_from_raw_map(
+        self,
+        raw_map: np.ndarray | None,
+        *,
+        optimizer_mask_stage: str,
+        metric_value: float,
+        chi2: float | None,
+        rho2: float | None,
+        eta2: float | None,
+        shift_x: float | None = None,
+        shift_y: float | None = None,
+        shift_valid: bool | None = None,
+    ) -> tuple[float, float | None, float | None, float | None, str, float | None, float | None, bool | None]:
+        curve_mask = self._warm_curve_rescore_mask_type()
+        stage_label = str(optimizer_mask_stage or curve_mask).strip().lower() or curve_mask
+        if (
+            not self._needs_curve_metric_rescore()
+            or raw_map is None
+            or stage_label == curve_mask
+        ):
+            return metric_value, chi2, rho2, eta2, stage_label, shift_x, shift_y, shift_valid
+        evaluation = self._rescore_raw_map_for_curve(raw_map)
+        if evaluation is None:
+            return metric_value, chi2, rho2, eta2, stage_label, shift_x, shift_y, shift_valid
+        return (
+            _target_metric_value(evaluation.metrics, self._target_metric),
+            float(evaluation.metrics.chi2),
+            float(evaluation.metrics.rho2),
+            float(evaluation.metrics.eta2),
+            curve_mask,
+            float(evaluation.shift_x_arcsec),
+            float(evaluation.shift_y_arcsec),
+            bool(evaluation.find_shift_valid),
+        )
+
+    def _pinned_promotion_search_id(self) -> str | None:
+        if not self._preserve_stored_search_trials:
+            return None
+        search_id = str(
+            self._diagnostics.get("selected_search_id")
+            or self._diagnostics.get("search_id")
+            or ""
+        ).strip()
+        return search_id or None
 
     def set_slice_map_index(self, index: Any | None) -> None:
         self._slice_map_index = index
@@ -3023,6 +3921,141 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             if GRID_POINTS_GROUP not in search_group or point_id not in search_group[GRID_POINTS_GROUP]:
                 return []
             return _load_grid_point_trials(search_group[GRID_POINTS_GROUP][point_id], include_maps=False)
+
+    def _identity_target_domain_and_label(self) -> tuple[str, str]:
+        domain = str(self._diagnostics.get("spectral_domain") or "").strip().lower()
+        if domain == "mw":
+            frequency = self._diagnostics.get("frequency_ghz")
+            if frequency is not None:
+                try:
+                    return "mw", f"{float(frequency):.6f}ghz"
+                except Exception:
+                    pass
+            label = str(self._diagnostics.get("spectral_label") or self._diagnostics.get("target_slice_key") or "").strip()
+            return "mw", label or "unknown"
+        if domain in {"euv", "uv"}:
+            channel = str(self._diagnostics.get("euv_channel") or "").strip()
+            if not channel:
+                slice_key = str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip()
+                if slice_key.lower().startswith(("euv_", "uv_")):
+                    channel = slice_key.split("_", 1)[1]
+            if not channel:
+                channel = str(self._diagnostics.get("spectral_label") or "").strip()
+            return domain, _normalize_euv_channel_identity_label(channel) or "unknown"
+        label = str(self._diagnostics.get("spectral_label") or self._diagnostics.get("target_slice_key") or "unknown").strip()
+        return domain or "unknown", label or "unknown"
+
+    def _raw_trial_map_identity(self, *, a_value: float, b_value: float, q0_value: float) -> dict[str, Any]:
+        domain, label = self._identity_target_domain_and_label()
+        return _build_synthetic_map_identity(
+            renderer_factory=self._renderer_factory,
+            a_value=float(a_value),
+            b_value=float(b_value),
+            q0_value=float(q0_value),
+            domain_label=domain,
+            channel_or_frequency_label=label,
+            component="stokes_i",
+        )
+
+    def _trial_map_store_payload(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        q0_value: float,
+    ) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
+        record = self._render_stream.snapshot_record(a_value=float(a_value), b_value=float(b_value))
+        if record is None:
+            return {}, {}
+        arrays: dict[str, np.ndarray] = {}
+        identities: dict[str, dict[str, Any]] = {}
+
+        def register(identity: dict[str, Any], array: Any) -> None:
+            if array is None:
+                return
+            map_store_name = f"synthetic/{_canonical_json_sha256(identity)}"
+            arrays[map_store_name] = np.asarray(array, dtype=np.float32)
+            identities[map_store_name] = dict(identity)
+
+        components = _lookup_stream_value_by_q0(record.components_by_q0, float(q0_value))
+        if isinstance(components, dict):
+            for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+                channel_label = _normalize_euv_channel_identity_label(channel)
+                register(
+                    _build_synthetic_map_identity(
+                        renderer_factory=self._renderer_factory,
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                        domain_label="euv",
+                        channel_or_frequency_label=channel_label,
+                        component="stokes_i",
+                    ),
+                    rendered,
+                )
+            for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+                channel_label = _normalize_euv_channel_identity_label(channel)
+                register(
+                    _build_synthetic_map_identity(
+                        renderer_factory=self._renderer_factory,
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                        domain_label="euv",
+                        channel_or_frequency_label=channel_label,
+                        component="corona",
+                    ),
+                    rendered,
+                )
+            for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
+                channel_label = _normalize_euv_channel_identity_label(channel)
+                register(
+                    _build_synthetic_map_identity(
+                        renderer_factory=self._renderer_factory,
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                        domain_label="euv",
+                        channel_or_frequency_label=channel_label,
+                        component="tr",
+                    ),
+                    rendered,
+                )
+
+        cube_payload = _lookup_stream_value_by_q0(record.cube_by_q0, float(q0_value))
+        if isinstance(cube_payload, dict):
+            stokes_v_by_frequency = dict(cube_payload.get("stokes_v_by_frequency", {}))
+            for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
+                freq_label = f"{float(freq):.6f}ghz"
+                register(
+                    _build_synthetic_map_identity(
+                        renderer_factory=self._renderer_factory,
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                        domain_label="mw",
+                        channel_or_frequency_label=freq_label,
+                        component="stokes_i",
+                    ),
+                    rendered,
+                )
+                rendered_v = stokes_v_by_frequency.get(freq)
+                if rendered_v is None:
+                    rendered_v = stokes_v_by_frequency.get(float(freq))
+                if rendered_v is not None:
+                    register(
+                        _build_synthetic_map_identity(
+                            renderer_factory=self._renderer_factory,
+                            a_value=float(a_value),
+                            b_value=float(b_value),
+                            q0_value=float(q0_value),
+                            domain_label="mw",
+                            channel_or_frequency_label=freq_label,
+                            component="stokes_v",
+                        ),
+                        rendered_v,
+                    )
+        return arrays, identities
 
     def _ensure_grid_point_map_contract(self, a_value: float, b_value: float) -> None:
         """Reject restored trial metadata without map_store links; reset point for a clean run."""
@@ -3092,6 +4125,17 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 return len(existing_trials)
         if self._slice_map_index is None or not self._slice_map_index.has_point(float(a_value), float(b_value)):
             return 0
+        if self.defer_warm_curve_commits():
+            point_key = (float(a_value), float(b_value))
+            if point_id is None:
+                q0_seed = float(self._diagnostics.get("q0_start", 5e-4))
+                self.assign_grid_points([(float(a_value), float(b_value), q0_seed)])
+                point_id = self.point_id_for(float(a_value), float(b_value))
+            if point_id is not None:
+                self._trials_committed[point_key] = len(
+                    select_fit_trials_for_viewer(self._load_grid_trials_for_point(str(point_id)))
+                )
+            return 0
         point_id = self.point_id_for(float(a_value), float(b_value))
         if point_id is None:
             q0_seed = float(self._diagnostics.get("q0_start", 5e-4))
@@ -3118,6 +4162,8 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             explicit_mask=self._explicit_metric_mask,
             target_metric=self._target_metric,
             use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
+            mask_type=self._warm_curve_rescore_mask_type(),
+            observation_reference=self._observation_reference,
         )
         if not events:
             return 0
@@ -3150,7 +4196,10 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         point_id = self.point_id_for(float(a_value), float(b_value))
         slice_key = self._target_slice_key()
         if point_id is not None and slice_key:
-            from pychmp.warm_q0 import initial_evaluations_from_grid_trials
+            from pychmp.warm_q0 import (
+                initial_evaluations_from_grid_trials,
+                load_warm_q0_evaluations_for_grid_point,
+            )
 
             trials = self._load_grid_trials_for_point(str(point_id))
             if (
@@ -3158,6 +4207,21 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 and self._slice_map_index is not None
                 and self._slice_map_index.has_point(float(a_value), float(b_value))
             ):
+                if self.defer_warm_curve_commits():
+                    return load_warm_q0_evaluations_for_grid_point(
+                        self._artifact_h5,
+                        slice_key=str(slice_key),
+                        search_id=self._resolve_search_id_from_artifact(),
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        context=self._warm_evaluation_context(),
+                        threshold=float(self._diagnostics.get("metrics_mask_threshold", 0.1)),
+                        explicit_mask=self._explicit_metric_mask,
+                        target_metric=self._target_metric,
+                        use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
+                        slice_map_index=self._slice_map_index,
+                        mask_type=self._warm_bracket_seed_mask_type(),
+                    )
                 self.commit_map_store_warm_trials_for_point(float(a_value), float(b_value))
                 trials = self._load_grid_trials_for_point(str(point_id))
             evaluations = initial_evaluations_from_grid_trials(
@@ -3169,7 +4233,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 threshold=float(self._diagnostics.get("metrics_mask_threshold", 0.1)),
                 explicit_mask=self._explicit_metric_mask,
                 use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
-                rescore=not bool(self._preserve_stored_search_trials),
+                # These trials belong to this search and were already scored
+                # when committed. Only a different optimizer mask stage needs
+                # another evaluation (e.g. data seeds versus union curves).
+                rescore=(not self._preserve_stored_search_trials and self._needs_curve_metric_rescore()),
+                mask_type=self._warm_bracket_seed_mask_type(),
             )
             if evaluations:
                 return evaluations
@@ -3190,6 +4258,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             target_metric=self._target_metric,
             use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
             slice_map_index=self._slice_map_index,
+            mask_type=self._warm_bracket_seed_mask_type(),
         )
 
     def set_resume_policy(
@@ -3204,6 +4273,90 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
 
     def pending_resume_q0_start(self, a_value: float, b_value: float) -> float | None:
         return self._resume_q0.get((float(a_value), float(b_value)))
+
+    def point_needs_completion(self, a_value: float, b_value: float) -> bool:
+        return (float(a_value), float(b_value)) in self._resume_q0
+
+    def partial_point_results(self) -> dict[tuple[float, float], ABPointResult]:
+        return dict(self._partial_point_map)
+
+    def incomplete_resume_candidates(
+        self,
+    ) -> list[tuple[float, float, float]]:
+        return [
+            (float(a_value), float(b_value), float(q0_seed))
+            for (a_value, b_value), q0_seed in sorted(self._resume_q0.items())
+            if np.isfinite(float(q0_seed))
+        ]
+
+    def clear_resume_point(self, a_value: float, b_value: float) -> None:
+        key = (float(a_value), float(b_value))
+        self._resume_q0.pop(key, None)
+        self._partial_point_map.pop(key, None)
+
+    def try_finalize_resume_point_from_stored_trials(
+        self,
+        a_value: float,
+        b_value: float,
+    ) -> ABPointResult | None:
+        """Finalize a repair-resume grid point from committed trials without new renders."""
+        a_value = float(a_value)
+        b_value = float(b_value)
+        if not self._preserve_stored_search_trials:
+            return None
+        if not self.point_needs_completion(a_value, b_value):
+            return None
+        point_id = self.point_id_for(a_value, b_value)
+        if point_id is None:
+            point_id = self._sync_point_id_from_artifact(a_value, b_value)
+        if point_id is None:
+            return None
+        trials = self._load_grid_trials_for_point(str(point_id))
+        fit_trials = select_fit_trials_for_viewer(trials)
+        if len(fit_trials) < 3:
+            return None
+        slice_key = self._target_slice_key()
+        search_id = self._resolve_search_id_from_artifact()
+        if slice_key and search_id:
+            links_ok = self._grid_point_map_links_status(
+                slice_key=str(slice_key),
+                search_id=str(search_id),
+                point_id=str(point_id),
+            )
+            if links_ok is False:
+                return None
+        if not slice_key or not search_id or not self._artifact_h5.exists():
+            return None
+        with _H5PY_FILE(str(self._artifact_h5), "r") as f:
+            if SLICE_CONTAINER_GROUP not in f or slice_key not in f[SLICE_CONTAINER_GROUP]:
+                return None
+            slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
+            if SEARCHES_GROUP not in slice_group or search_id not in slice_group[SEARCHES_GROUP]:
+                return None
+            search_group = slice_group[SEARCHES_GROUP][search_id]
+            if GRID_POINTS_GROUP not in search_group or str(point_id) not in search_group[GRID_POINTS_GROUP]:
+                return None
+            header = read_grid_point_header(search_group[GRID_POINTS_GROUP][str(point_id)])
+        # A warm curve (or an interrupted optimizer) is not proof of convergence.
+        # Only an explicitly completed point can bypass the optimizer.
+        if classify_grid_point_state(header) != "complete":
+            return None
+        restored = _ab_point_from_completed_grid_point(
+            header,
+            trials,
+            target_metric=self._target_metric,
+        )
+        if restored is None:
+            return None
+        print(
+            f"    Resume finalize: a={a_value:.3f} b={b_value:.3f} "
+            f"from {len(fit_trials)} stored trial(s) "
+            f"q0={float(restored.q0):.6g} "
+            f"{self._target_metric}={float(restored.objective_value):.6e} "
+            "(no new renders)",
+            flush=True,
+        )
+        return restored
 
     def _resolve_search_id_from_artifact(self) -> str | None:
         configured = str(
@@ -3269,6 +4422,13 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
     ) -> None:
         force = self._recompute_existing if force_new is None else bool(force_new)
         for a_value, b_value, q0_start in assignments:
+            point_key = (float(a_value), float(b_value))
+            if (
+                not force
+                and point_key in self._resume_q0
+                and int(self._trials_committed.get(point_key, 0)) > 0
+            ):
+                continue
             q0_seed = float(q0_start) if q0_start is not None else float(np.sqrt(float(self._diagnostics.get("q0_min", 1e-5)) * float(self._diagnostics.get("q0_max", 1e-3))))
             event = GridPointAssignedEvent(
                 a=float(a_value),
@@ -3353,6 +4513,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if shift_valid is not None:
             shift_kwargs["shift_valid"] = bool(shift_valid)
         merged_metadata = {**dict(shift_kwargs.get("trial_metadata") or {}), **dict(trial_metadata or {})}
+        map_store_arrays, map_store_identities = self._trial_map_store_payload(
+            a_value=float(a_value),
+            b_value=float(b_value),
+            q0_value=float(q0_value),
+        )
         event = GridTrialCommittedEvent(
             point_id=str(point_id),
             trial_index=int(trial_index),
@@ -3362,6 +4527,13 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             best_trial_index=int(best_index),
             best_metric=float(metric_value),
             raw_modeled_map=raw_modeled_map,
+            raw_map_identity=self._raw_trial_map_identity(
+                a_value=float(a_value),
+                b_value=float(b_value),
+                q0_value=float(q0_value),
+            ),
+            map_store_arrays=map_store_arrays,
+            map_store_identities=map_store_identities,
             trial_metadata=merged_metadata,
             shift_x=shift_kwargs.get("shift_x"),
             shift_y=shift_kwargs.get("shift_y"),
@@ -3391,6 +4563,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         shift_x_trials: list[float] | None = None,
         shift_y_trials: list[float] | None = None,
         shift_valid_trials: list[bool] | None = None,
+        mask_stage_trials: list[str] | None = None,
     ) -> None:
         if active_trial_q0 is not None and active_trial_index is not None:
             self.update_active_q0(a_value=float(a_value), b_value=float(b_value), q0_value=float(active_trial_q0))
@@ -3427,8 +4600,65 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             shift_x_trials=shift_x_trials,
             shift_y_trials=shift_y_trials,
             shift_valid_trials=shift_valid_trials,
+            mask_stage_trials=mask_stage_trials,
         )
         merged_metadata = {**dict(shift_kwargs.get("trial_metadata") or {}), **dict(trial_metadata or {})}
+        map_store_arrays, map_store_identities = self._trial_map_store_payload(
+            a_value=float(a_value),
+            b_value=float(b_value),
+            q0_value=float(q0_value),
+        )
+        if not str(merged_metadata.get("stage", "")).strip():
+            q0_stages = [
+                str(stage).strip().lower()
+                for stage in (self._diagnostics.get("q0_search_stages") or ())
+                if str(stage).strip()
+            ]
+            if len(q0_stages) == 1:
+                merged_metadata["stage"] = q0_stages[0]
+        optimizer_stage = str(merged_metadata.get("stage", "") or "").strip()
+        (
+            metric_value,
+            trial_chi2,
+            trial_rho2,
+            trial_eta2,
+            curve_stage,
+            curve_shift_x,
+            curve_shift_y,
+            curve_shift_valid,
+        ) = self._curve_commit_metrics_from_raw_map(
+            np.asarray(completed_trial_raw_map, dtype=float),
+            optimizer_mask_stage=optimizer_stage,
+            metric_value=float(metric_value),
+            chi2=trial_chi2,
+            rho2=trial_rho2,
+            eta2=trial_eta2,
+            shift_x=shift_kwargs.get("shift_x"),
+            shift_y=shift_kwargs.get("shift_y"),
+            shift_valid=shift_kwargs.get("shift_valid"),
+        )
+        merged_metadata["stage"] = curve_stage
+        if (
+            self._needs_curve_metric_rescore()
+            and curve_stage == self._warm_curve_rescore_mask_type()
+            and np.isfinite(float(metric_value))
+        ):
+            if live_index < len(metric_trials):
+                metric_trials[live_index] = float(metric_value)
+            if chi2_trials is not None and live_index < len(chi2_trials) and trial_chi2 is not None:
+                chi2_trials[live_index] = float(trial_chi2)
+            if rho2_trials is not None and live_index < len(rho2_trials) and trial_rho2 is not None:
+                rho2_trials[live_index] = float(trial_rho2)
+            if eta2_trials is not None and live_index < len(eta2_trials) and trial_eta2 is not None:
+                eta2_trials[live_index] = float(trial_eta2)
+            finite = [
+                (idx, float(metric_trials[idx]))
+                for idx in range(len(metric_trials))
+                if np.isfinite(float(metric_trials[idx]))
+            ]
+            if finite:
+                best_live_index, best_metric = min(finite, key=lambda item: item[1])
+                best_index = int(base_index) + int(best_live_index)
         self._writer.write_grid_event(
             GridTrialCommittedEvent(
                 point_id=str(self.point_id_for(a_value, b_value) or ""),
@@ -3439,10 +4669,17 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 best_trial_index=int(best_index),
                 best_metric=float(best_metric),
                 raw_modeled_map=np.asarray(completed_trial_raw_map, dtype=np.float32),
+                raw_map_identity=self._raw_trial_map_identity(
+                    a_value=float(a_value),
+                    b_value=float(b_value),
+                    q0_value=float(q0_value),
+                ),
+                map_store_arrays=map_store_arrays,
+                map_store_identities=map_store_identities,
                 trial_metadata=merged_metadata,
-                shift_x=shift_kwargs.get("shift_x"),
-                shift_y=shift_kwargs.get("shift_y"),
-                shift_valid=shift_kwargs.get("shift_valid"),
+                shift_x=curve_shift_x if curve_shift_x is not None else shift_kwargs.get("shift_x"),
+                shift_y=curve_shift_y if curve_shift_y is not None else shift_kwargs.get("shift_y"),
+                shift_valid=curve_shift_valid if curve_shift_valid is not None else shift_kwargs.get("shift_valid"),
                 chi2=trial_chi2,
                 rho2=trial_rho2,
                 eta2=trial_eta2,
@@ -3452,6 +4689,49 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             int(self._trials_committed.get(point_key, 0)),
             int(grid_trial_index) + 1,
         )
+
+    @staticmethod
+    def _grid_trial_ref_lookup_maps(
+        loaded_trials: list[dict[str, Any]],
+    ) -> tuple[dict[int, str], dict[float, str]]:
+        refs_by_index: dict[int, str] = {}
+        refs_by_q0: dict[float, str] = {}
+        for item in loaded_trials:
+            ref = str(item.get("raw_map_ref", "") or "").strip()
+            if not ref:
+                continue
+            refs_by_index[int(item["trial_index"])] = ref
+            refs_by_q0[float(item["q0"])] = ref
+        return refs_by_index, refs_by_q0
+
+    @staticmethod
+    def _linked_ref_for_commit_trial(
+        *,
+        trial_index: int,
+        q0_value: float,
+        refs_by_index: dict[int, str],
+        refs_by_q0: dict[float, str],
+    ) -> str:
+        ref = str(refs_by_index.get(int(trial_index), "")).strip()
+        if ref:
+            return ref
+        target = float(q0_value)
+        for candidate_q0, candidate_ref in refs_by_q0.items():
+            if np.isclose(candidate_q0, target, rtol=0.0, atol=1e-12):
+                return str(candidate_ref).strip()
+        return ""
+
+    def _read_raw_map_from_store_ref(self, ref: str) -> np.ndarray | None:
+        ref_text = str(ref or "").strip()
+        if not ref_text:
+            return None
+        from pychmp.ab_scan_artifacts import _H5PY_FILE, _read_map_store_ref_array
+
+        with _H5PY_FILE(self._artifact_h5, "r") as h5_file:
+            loaded = _read_map_store_ref_array(h5_file, ref_text)
+        if loaded is None:
+            return None
+        return np.asarray(loaded, dtype=np.float32)
 
     def _commit_completed_point_from_payload(
         self,
@@ -3477,12 +4757,17 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         shift_x_trials = payload.get("fit_shift_x_trials", result.trial_shift_x_arcsec)
         shift_y_trials = payload.get("fit_shift_y_trials", result.trial_shift_y_arcsec)
         shift_valid_trials = payload.get("fit_find_shift_valid_trials", result.trial_find_shift_valid)
-        existing_refs: dict[int, str] = {}
+        trial_mask_stages = tuple(
+            str(value)
+            for value in (
+                payload.get("fit_trial_mask_stages")
+                or result.trial_mask_stages
+                or ()
+            )
+        )
+        self._writer.drain()
         loaded_trials = self._load_grid_trials_for_point(str(point_id))
-        for item in loaded_trials:
-            ref = str(item.get("raw_map_ref", "") or "").strip()
-            if ref:
-                existing_refs[int(item["trial_index"])] = ref
+        refs_by_index, refs_by_q0 = self._grid_trial_ref_lookup_maps(loaded_trials)
 
         for trial_index, q0_value in enumerate(q0_trials):
             raw_map = None
@@ -3495,14 +4780,79 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             if raw_map is None:
                 raw_map = self.trial_raw_map_for(float(a_value), float(b_value), float(q0_value))
             if raw_map is None:
-                linked_ref = str(existing_refs.get(int(trial_index), "")).strip()
+                linked_ref = self._linked_ref_for_commit_trial(
+                    trial_index=int(trial_index),
+                    q0_value=float(q0_value),
+                    refs_by_index=refs_by_index,
+                    refs_by_q0=refs_by_q0,
+                )
+                if not linked_ref:
+                    linked_ref = str(self.stored_raw_map_ref_for(float(a_value), float(b_value), float(q0_value)) or "").strip()
+                if linked_ref:
+                    raw_map = self._read_raw_map_from_store_ref(linked_ref)
+            curve_raw_map = None if raw_map is None else np.asarray(raw_map, dtype=float)
+            if curve_raw_map is None and linked_ref:
+                loaded_ref_map = self._read_raw_map_from_store_ref(linked_ref)
+                if loaded_ref_map is not None:
+                    curve_raw_map = np.asarray(loaded_ref_map, dtype=float)
             q0_numeric = float(q0_value)
             if raw_map is None and not linked_ref and np.isfinite(q0_numeric) and q0_numeric > 0.0:
                 raise RuntimeError(
                     "Cannot commit grid trial without a stored map: "
                     f"a={float(a_value):.3f} b={float(b_value):.3f} trial_index={int(trial_index)} q0={q0_numeric:g}"
                 )
+            map_store_arrays, map_store_identities = self._trial_map_store_payload(
+                a_value=float(a_value),
+                b_value=float(b_value),
+                q0_value=float(q0_value),
+            )
+            trial_chi2 = float(chi2_trials[trial_index]) if trial_index < len(chi2_trials) else None
+            trial_rho2 = float(rho2_trials[trial_index]) if trial_index < len(rho2_trials) else None
+            trial_eta2 = float(eta2_trials[trial_index]) if trial_index < len(eta2_trials) else None
             metric_value = float(metric_trials[trial_index]) if trial_index < len(metric_trials) else float("nan")
+            optimizer_stage = (
+                str(trial_mask_stages[trial_index]).strip()
+                if trial_index < len(trial_mask_stages)
+                else ""
+            )
+            shift_kwargs = _grid_trial_shift_commit_kwargs(
+                trial_index=int(trial_index),
+                payload=payload,
+                result=result,
+                shift_x_trials=shift_x_trials,
+                shift_y_trials=shift_y_trials,
+                shift_valid_trials=shift_valid_trials,
+            )
+            (
+                metric_value,
+                trial_chi2,
+                trial_rho2,
+                trial_eta2,
+                curve_stage,
+                curve_shift_x,
+                curve_shift_y,
+                curve_shift_valid,
+            ) = self._curve_commit_metrics_from_raw_map(
+                curve_raw_map,
+                optimizer_mask_stage=optimizer_stage,
+                metric_value=float(metric_value),
+                chi2=trial_chi2,
+                rho2=trial_rho2,
+                eta2=trial_eta2,
+                shift_x=shift_kwargs.get("shift_x"),
+                shift_y=shift_kwargs.get("shift_y"),
+                shift_valid=shift_kwargs.get("shift_valid"),
+            )
+            if trial_index < len(metric_trials):
+                metric_trials[trial_index] = float(metric_value)
+            if trial_chi2 is not None and trial_index < len(chi2_trials):
+                chi2_trials[trial_index] = float(trial_chi2)
+            if trial_rho2 is not None and trial_index < len(rho2_trials):
+                rho2_trials[trial_index] = float(trial_rho2)
+            if trial_eta2 is not None and trial_index < len(eta2_trials):
+                eta2_trials[trial_index] = float(trial_eta2)
+            trial_metadata = dict(shift_kwargs.get("trial_metadata") or {})
+            trial_metadata["stage"] = curve_stage
             finite_metrics = [
                 (idx, float(metric_trials[idx]))
                 for idx in range(len(metric_trials))
@@ -3512,14 +4862,6 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             best_metric = float(metric_value)
             if finite_metrics:
                 best_index, best_metric = min(finite_metrics, key=lambda item: item[1])
-            shift_kwargs = _grid_trial_shift_commit_kwargs(
-                trial_index=int(trial_index),
-                payload=payload,
-                result=result,
-                shift_x_trials=shift_x_trials,
-                shift_y_trials=shift_y_trials,
-                shift_valid_trials=shift_valid_trials,
-            )
             self._writer.write_grid_event(
                 GridTrialCommittedEvent(
                     point_id=str(point_id),
@@ -3531,13 +4873,20 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     best_metric=float(best_metric),
                     raw_modeled_map=None if raw_map is None else np.asarray(raw_map, dtype=np.float32),
                     raw_map_ref=linked_ref or None,
-                    trial_metadata=dict(shift_kwargs.get("trial_metadata") or {}),
-                    shift_x=shift_kwargs.get("shift_x"),
-                    shift_y=shift_kwargs.get("shift_y"),
-                    shift_valid=shift_kwargs.get("shift_valid"),
-                    chi2=float(chi2_trials[trial_index]) if trial_index < len(chi2_trials) else None,
-                    rho2=float(rho2_trials[trial_index]) if trial_index < len(rho2_trials) else None,
-                    eta2=float(eta2_trials[trial_index]) if trial_index < len(eta2_trials) else None,
+                    raw_map_identity=self._raw_trial_map_identity(
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                    ),
+                    map_store_arrays=map_store_arrays,
+                    map_store_identities=map_store_identities,
+                    trial_metadata=trial_metadata,
+                    shift_x=curve_shift_x if curve_shift_x is not None else shift_kwargs.get("shift_x"),
+                    shift_y=curve_shift_y if curve_shift_y is not None else shift_kwargs.get("shift_y"),
+                    shift_valid=curve_shift_valid if curve_shift_valid is not None else shift_kwargs.get("shift_valid"),
+                    chi2=trial_chi2,
+                    rho2=trial_rho2,
+                    eta2=trial_eta2,
                 )
             )
         finite_metrics = [
@@ -3590,12 +4939,36 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
 
     def trial_raw_map_for(self, a_value: float, b_value: float, q0_value: float) -> np.ndarray | None:
         record = self._render_stream.snapshot_record(a_value=float(a_value), b_value=float(b_value))
-        if record is None:
+        if record is not None:
+            raw_map = _lookup_stream_value_by_q0(record.raw_modeled_by_q0, float(q0_value))
+            if raw_map is not None:
+                return np.asarray(raw_map, dtype=np.float32)
+        if self._slice_map_index is not None and self._artifact_h5.exists():
+            from pychmp.slice_map_index import load_render_pair_from_index
+
+            pair = load_render_pair_from_index(
+                self._artifact_h5,
+                index=self._slice_map_index,
+                a=float(a_value),
+                b=float(b_value),
+                q0=float(q0_value),
+                observed_template=np.asarray(self._observed, dtype=float),
+                psf_kernel=self._psf_kernel,
+            )
+            if pair is not None:
+                raw_map, _modeled = pair
+                return np.asarray(raw_map, dtype=np.float32)
+        return None
+
+    def stored_raw_map_ref_for(self, a_value: float, b_value: float, q0_value: float) -> str | None:
+        index = self._slice_map_index
+        if index is None:
             return None
-        raw_map = _lookup_stream_value_by_q0(record.raw_modeled_by_q0, float(q0_value))
-        if raw_map is None:
+        raw_ref = index.raw_map_ref(float(a_value), float(b_value), float(q0_value))
+        if raw_ref is None:
             return None
-        return np.asarray(raw_map, dtype=np.float32)
+        raw_ref = str(raw_ref).strip()
+        return raw_ref or None
 
     def drop_persisted_trial_render(self, a_value: float, b_value: float, q0_value: float) -> None:
         self._render_stream.drop_trial_render(
@@ -3666,6 +5039,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 target_metric=self._target_metric,
                 psf_kernel=self._psf_kernel,
                 evaluation_context=evaluation_context,
+                mask_type=self._warm_rescore_mask_type(),
             )
             if warm_evaluations is None:
                 continue
@@ -3686,7 +5060,10 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if not self._artifact_h5.exists():
             return 0
         try:
-            payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key(), include_maps=False)
+            payload = load_scan_file(
+                self._artifact_h5, slice_key=self._target_slice_key(),
+                search_id=self._diagnostics.get("selected_search_id"), include_maps=False,
+            )
         except KeyError:
             return 0
         if bool(dict(payload.get("diagnostics") or {}).get("render_only_slice", False)) and not payload.get("point_records"):
@@ -3771,11 +5148,30 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                                             )
                                     if np.isfinite(resume_q0):
                                         self._resume_q0[key] = float(resume_q0)
+                                    if (
+                                        state in {"running_partial", "failed"}
+                                        and int(header.get("n_trials", 0)) > 0
+                                        and key not in self._partial_point_map
+                                    ):
+                                        try:
+                                            trials = _load_grid_point_trials(
+                                                point_group, include_maps=False
+                                            )
+                                            restored = _ab_point_from_completed_grid_point(
+                                                header,
+                                                trials,
+                                                target_metric=self._target_metric,
+                                            )
+                                        except (OSError, RuntimeError, KeyError):
+                                            restored = None
+                                        if restored is not None:
+                                            self._partial_point_map[key] = restored
             except Exception:
                 pass
         return count
 
     def _iter_rescore_candidate_records(self, *, include_maps: bool) -> Iterator[tuple[str | None, dict[str, Any]]]:
+        restrict_search_id = self._pinned_promotion_search_id()
         try:
             current_payload = load_scan_file(
                 self._artifact_h5,
@@ -3785,16 +5181,19 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         except KeyError:
             return
         seen_keys: set[tuple[float, float]] = set()
-        for record in current_payload.get("point_records", []):
-            if not isinstance(record, dict):
-                continue
-            key = (float(record["a"]), float(record["b"]))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            yield None, dict(record)
+        if not restrict_search_id:
+            for record in current_payload.get("point_records", []):
+                if not isinstance(record, dict):
+                    continue
+                key = (float(record["a"]), float(record["b"]))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                yield None, dict(record)
         for search in current_payload.get("search_records", []):
             search_id = str(search.get("search_id", "")).strip() or None
+            if restrict_search_id and search_id != restrict_search_id:
+                continue
             if search_id:
                 try:
                     search_payload = load_scan_file(
@@ -3852,6 +5251,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 compatibility_signature=self._compatibility_signature,
             ) and not bool(include_matching_signature):
                 continue
+            from pychmp.q0_search import point_record_trial_stages_match_recipe
+
+            q0_stages = tuple(str(stage) for stage in self._diagnostics.get("q0_search_stages") or ())
+            if q0_stages and not point_record_trial_stages_match_recipe(record, q0_search_stages=q0_stages):
+                continue
             warm_evaluations = _rescore_record_to_warm_initial_evaluations(
                 {
                     **dict(record),
@@ -3865,6 +5269,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 target_metric=self._target_metric,
                 psf_kernel=self._psf_kernel,
                 evaluation_context=evaluation_context,
+                mask_type=self._warm_rescore_mask_type(),
             )
             if warm_evaluations is None:
                 continue
@@ -3908,6 +5313,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         self._writer.drain()
         save_elapsed = time.perf_counter() - save_started
         self._point_map[normalized_key] = value
+        self.clear_resume_point(float(value.a), float(value.b))
         if self._viewer_heartbeat is not None:
             self._viewer_heartbeat.clear_active_trial()
             self._viewer_heartbeat.set_phase(
@@ -3987,6 +5393,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-mask-threshold", type=float, default=0.1, help="Relative threshold used by the default union metrics mask.")
     parser.add_argument("--metrics-mask-fits", type=Path, default=None, help="Optional FITS bit mask used for metrics evaluation. Non-zero finite pixels are treated as in-mask and override --metrics-mask-threshold.")
     parser.add_argument("--tr-mask-bmin-gauss", type=float, default=1000.0, help="For EUV/UV, build the default TR-region mask from abs(B_los) >= Bmin [G]. Negative inputs are treated as abs(Bmin).")
+    parser.add_argument("--tr-mask-fits", type=Path, default=None, help="Optional FITS bit mask used to gate EUV/UV TR-component contribution. Non-zero finite pixels are treated as in-mask and must match the synthetic-map shape.")
     parser.add_argument("--threshold", dest="metrics_mask_threshold", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--mask-type", choices=("union", "data", "model", "and"), default="union", help=argparse.SUPPRESS)
     parser.add_argument("--threshold-metric", type=float, default=1.1, help="Phase-2 threshold region multiplier around the best point")
@@ -4004,9 +5411,32 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tbase", type=float, default=DEFAULT_TBASE, help="Base temperature in K")
     parser.add_argument("--nbase", type=float, default=DEFAULT_NBASE, help="Base density in cm^-3")
+    parser.add_argument(
+        "--euv-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use parallel LOS rays for EUV/UV rendering.",
+    )
+    parser.add_argument(
+        "--euv-exact",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use exact LOS geometry for EUV/UV rendering.",
+    )
+    parser.add_argument(
+        "--euv-projection-threads",
+        type=int,
+        default=0,
+        help="Thread count encoded in the EUV projection word (0 leaves it unset).",
+    )
     parser.add_argument("--observer", default=None, help="Observer name override, e.g. earth")
     parser.add_argument("--dsun-cm", type=float, default=None, help="Observer-Sun distance override in cm")
-    parser.add_argument("--lonc-deg", type=float, default=None, help="Observer Carrington longitude override in degrees")
+    parser.add_argument(
+        "--lonc-deg",
+        type=float,
+        default=None,
+        help="gxrender renderer-relative model longitude override in degrees",
+    )
     parser.add_argument("--b0sun-deg", type=float, default=None, help="Observer latitude override in degrees")
     parser.add_argument("--pixel-scale-arcsec", type=float, default=2.0, help="Pixel scale used with the model saved FOV")
     parser.add_argument("--psf-bmaj-arcsec", type=float, default=None, help="PSF major-axis FWHM in arcsec")
@@ -4107,6 +5537,29 @@ def _resolve_geometry_request_flags(args: argparse.Namespace) -> tuple[bool, boo
     return geometry_overrides_requested, explicit_observer_requested
 
 
+def _resolve_persisted_euv_response_identity(
+    prebuilt_euv_response: Any,
+    *,
+    response_adapter: Any | None = None,
+) -> Any:
+    """Resolve EUV response identity after load-or-save.
+
+    Loaded-from-artifact paths never construct ``response_adapter``. Prefer an
+    attached ``response_identity`` and only fall back to the adapter when one
+    was built in this process; otherwise raise explicitly instead of NameError.
+    """
+    if prebuilt_euv_response is None:
+        raise RuntimeError("Unable to resolve EUV response for persistence; search not started")
+    identity = getattr(prebuilt_euv_response, "response_identity", None)
+    if identity is not None:
+        return identity
+    if response_adapter is None:
+        raise RuntimeError(
+            "Loaded EUV response has no response_identity and no adapter was constructed"
+        )
+    return response_adapter.response_identity()
+
+
 def main() -> int:
     args = _parse_args()
     recompute_search_id = _configure_targeted_recompute_search(args)
@@ -4192,6 +5645,13 @@ def main() -> int:
     )
     resume_slice_diagnostics = dict(resume_slice_payload.get("diagnostics") or {}) if resume_slice_payload is not None else {}
     if (
+        resume_slice_payload is not None
+        and bool(resume_slice_diagnostics.get("render_only_slice"))
+    ):
+        print(f"  Slice preload: ignoring render-only placeholder for target slice {target_slice_key}")
+        resume_slice_payload = None
+        resume_slice_diagnostics = {}
+    if (
         render_selection.domain != "mw"
         and render_selection.euv_response_sav is None
         and not _grid_reset_requested(args)
@@ -4219,23 +5679,34 @@ def main() -> int:
         nonlocal viewer_process
         if not auto_viewer_enabled:
             return
-        if viewer_process is not None and viewer_process.poll() is None:
-            print(f"pychmp-view already running ({phase}) pid={viewer_process.pid}")
+        decision = _decide_viewer_launch(
+            viewer_script=viewer_script,
+            artifact_h5=artifact_h5,
+            viewer_process=viewer_process,
+        )
+        if decision.action == "running":
+            print(f"pychmp-view already running ({phase}) pid={decision.pid}")
             if on_reused is not None:
                 on_reused()
             return
-        existing_viewer_pid = _find_existing_viewer_pid(viewer_script=viewer_script, artifact_h5=artifact_h5)
-        if existing_viewer_pid is not None:
+        if decision.action == "reuse":
             if on_reused is not None:
                 on_reused()
-            if _focus_existing_viewer_pid(int(existing_viewer_pid)):
-                print(f"Reusing existing pychmp-view ({phase}) pid={existing_viewer_pid} (brought to front)")
-                return
-            print(
-                f"Existing pychmp-view detected ({phase}) pid={existing_viewer_pid} but could not be focused; launching a fresh viewer"
-            )
+            brought_forward = " (brought to front)" if decision.focused else ""
+            if decision.pid is not None:
+                print(f"Reusing existing pychmp-view ({phase}) pid={decision.pid}{brought_forward}")
+            else:
+                print(f"Reusing existing pychmp-view ({phase}){brought_forward}")
+            return
         try:
-            proc = subprocess.Popen(viewer_cmd, start_new_session=True)
+            # Detach the viewer's streams too: inherited tee pipes would keep
+            # the shell launcher waiting after a completed-search early exit.
+            viewer_log = Path(f"{artifact_h5}.viewer.log")
+            with viewer_log.open("a") as log_stream:
+                proc = subprocess.Popen(
+                    viewer_cmd, start_new_session=True,
+                    stdin=subprocess.DEVNULL, stdout=log_stream, stderr=subprocess.STDOUT,
+                )
             if proc.poll() is not None:
                 print(f"WARNING: pychmp-view exited immediately after auto-launch ({phase}). Try running manually: {viewer_cmd_text}")
                 return
@@ -4311,6 +5782,8 @@ def main() -> int:
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
     selected_psf_metadata = None
+    cached_psf_recipe_source = None
+    cached_psf_recipe_meta = None
     if (
         artifact_preexisting
         and not bool(args.override_header_psf)
@@ -4324,6 +5797,8 @@ def main() -> int:
         )
         if cached_slice_psf is not None:
             selected_psf_metadata = cached_slice_psf
+            cached_psf_recipe_source = str(resume_slice_diagnostics.get("psf_source") or "").strip() or None
+            cached_psf_recipe_meta = resume_slice_diagnostics.get("resolved_psf")
             print(f"  PSF preload: restored kernel from artifact slice metadata ({target_slice_key})")
     if selected_psf_metadata is None:
         selected_psf_metadata = _resolve_selected_psf_metadata(
@@ -4369,8 +5844,10 @@ def main() -> int:
         geometry_overrides_requested=geometry_overrides_requested,
         explicit_observer_requested=explicit_observer_requested,
     )
-    geometry_observer_name = (
-        None if bool(geometry_policy.use_model_saved_fov) and not explicit_observer_requested else str(args.observer or geometry_policy.observer_name)
+    geometry_observer_name = resolve_renderer_observer_name(
+        geometry_policy,
+        explicit_observer_name=args.observer,
+        explicit_observer_requested=explicit_observer_requested,
     )
     geometry_observer = None if bool(geometry_policy.use_model_saved_fov) else (observer_overrides if explicit_observer_requested else None)
     resolved_geometry = resolve_render_geometry_via_gxrender(
@@ -4385,12 +5862,13 @@ def main() -> int:
     )
     geometry = resolved_geometry.geometry
     if not explicit_observer_requested:
-        observer_overrides = sdk.ObserverOverrides(
-            dsun_cm=float(geometry_policy.observer_dsun_cm),
-            lonc_deg=float(geometry_policy.observer_lonc_deg),
-            b0sun_deg=float(geometry_policy.observer_b0sun_deg),
-        )
+        observer_overrides = None
         observer_source = f"geometry_policy:{geometry_policy.observation_observer}"
+    render_observer_name = resolve_renderer_observer_name(
+        geometry_policy,
+        explicit_observer_name=args.observer,
+        explicit_observer_requested=explicit_observer_requested,
+    )
     effective_observer_name = str(args.observer or geometry_policy.observer_name)
     effective_observer_lonc_deg = float(
         getattr(observer_overrides, "lonc_deg", None)
@@ -4409,6 +5887,9 @@ def main() -> int:
     )
 
     model_obs_time = str(model_observer_meta.get("observer_obs_time") or load_model_obs_time_text(model_h5) or "").strip()
+    stored_model_time_reference = str(getattr(args, "stored_model_time_reference", "") or "").strip()
+    if stored_model_time_reference:
+        model_obs_time = stored_model_time_reference
     obs_time_text = str(obs_map.date_obs or header.get("DATE-OBS", header.get("DATE_OBS", "")) or "").strip()
     observation_time_override = str(getattr(args, "observation_time", "") or "").strip()
     if observation_time_override:
@@ -4563,7 +6044,18 @@ def main() -> int:
     )
     euv_tr_mask = None
     if render_selection.domain != "mw":
-        if blos_reference_for_fov is not None:
+        if args.tr_mask_fits is not None:
+            euv_tr_mask = _load_explicit_metric_mask(
+                args.tr_mask_fits,
+                expected_shape=tuple(np.asarray(observed_cropped, dtype=float).shape),
+            )
+            selected = int(np.count_nonzero(euv_tr_mask))
+            total = int(euv_tr_mask.size)
+            print(
+                f"  EUV TR mask: explicit FITS {Path(args.tr_mask_fits).expanduser()} "
+                f"({selected}/{total} pixels, {selected / max(total, 1):.1%})"
+            )
+        elif blos_reference_for_fov is not None:
             tr_mask_bmin_gauss = abs(float(args.tr_mask_bmin_gauss))
             euv_tr_mask = build_tr_region_mask_from_blos(
                 np.asarray(blos_reference_for_fov[0], dtype=float),
@@ -4599,7 +6091,7 @@ def main() -> int:
         mask_type=metrics_mask_type,
         explicit_mask=explicit_metric_mask,
     )
-    if len(chmp_settings.q0_search_stages) > 1:
+    if chmp_settings.q0_search_stages:
         print(f"  Q0 search stages: {', '.join(chmp_settings.q0_search_stages)}")
     print(
         "  CHMP evaluation: "
@@ -4674,29 +6166,37 @@ def main() -> int:
                         "psf_kernel_shape": compact_kernel_shape,
                         "psf_kernel_compacted": True,
                     }
+        if (
+            cached_psf_recipe_source
+            and isinstance(cached_psf_recipe_meta, dict)
+            and str(selected_psf_metadata.source).startswith("artifact_slice_psf")
+        ):
+            psf_source = cached_psf_recipe_source
+            resolved_psf_meta = dict(cached_psf_recipe_meta)
 
+    prebuilt_euv_response = None
+    response_store_request = None
     euv_response_identity = None
     euv_response_identity_version = None
     euv_response_sha256 = None
     euv_response_identity_summary = None
     if render_selection.domain != "mw":
-        reused_identity = False
-        if artifact_preexisting and not _grid_reset_requested(args):
-            cached_version = str(resume_slice_diagnostics.get("euv_response_identity_version") or "").strip()
-            cached_sha = str(resume_slice_diagnostics.get("euv_response_sha256") or "").strip()
-            cached_summary = resume_slice_diagnostics.get("euv_response_identity_summary")
-            if cached_version and cached_sha and isinstance(cached_summary, dict):
-                euv_response_identity_version = cached_version
-                euv_response_sha256 = cached_sha
-                euv_response_identity_summary = dict(cached_summary)
-                reused_identity = True
-                print("  EUV response identity: reused cached artifact diagnostics")
-        if not reused_identity:
-            identity_started = time.perf_counter()
-            euv_response_identity = resolve_euv_response_identity(
+        from pychmp.calibration_store import canonical_response, load_response, save_response
+
+        response_store_request = {
+            "model_sha256": str(model_sha256),
+            "instrument": str(render_selection.euv_instrument).upper(),
+            "channels": sorted(set([str(render_selection.euv_channel), *map(str, render_channels)])),
+            "source": "dynamic_evenorm_chiantifix" if render_selection.euv_response_sav is None else "sav",
+            "response_sav_sha256": None if render_selection.euv_response_sav is None else _compute_file_sha256(Path(render_selection.euv_response_sav)),
+        }
+        prebuilt_euv_response = load_response(artifact_h5, response_store_request)
+        if prebuilt_euv_response is None:
+            print("  EUV response: resolving calibration once before search startup...", flush=True)
+            response_adapter = GXRenderEUVAdapter(
                 model_path=str(model_h5),
                 channel=str(render_selection.euv_channel),
-                render_channels=render_channels,
+                render_channels=tuple(response_store_request["channels"]),
                 instrument=str(render_selection.euv_instrument),
                 response_sav=render_selection.euv_response_sav,
                 ebtel_path=str(ebtel_path),
@@ -4706,16 +6206,28 @@ def main() -> int:
                 b=float(args.b_start),
                 geometry=geometry,
                 observer=observer_overrides,
-                observer_name=effective_observer_name,
+                observer_name=render_observer_name,
                 tr_region_mask=euv_tr_mask,
                 pixel_scale_arcsec=float(args.pixel_scale_arcsec),
             )
-            if euv_response_identity is not None:
-                euv_response_identity_version = str(euv_response_identity.version)
-                euv_response_sha256 = str(euv_response_identity.sha256)
-                euv_response_identity_summary = dict(euv_response_identity.summary)
-            identity_elapsed = time.perf_counter() - identity_started
-            print(f"  EUV response identity: computed in {identity_elapsed:.2f}s")
+            prebuilt_euv_response = response_adapter._ensure_euv_response_cache()
+            if prebuilt_euv_response is None:
+                raise RuntimeError("Unable to resolve EUV response for persistence; search not started")
+            prebuilt_euv_response = canonical_response(prebuilt_euv_response)
+            if artifact_h5.exists():
+                save_response(artifact_h5, response_store_request, prebuilt_euv_response)
+                reloaded = load_response(artifact_h5, response_store_request)
+                if reloaded is not None:
+                    prebuilt_euv_response = reloaded
+        else:
+            print("  EUV response: loaded arrays from artifact (no response provider/network call)", flush=True)
+        euv_response_identity = _resolve_persisted_euv_response_identity(
+            prebuilt_euv_response,
+            response_adapter=locals().get("response_adapter"),
+        )
+        euv_response_identity_version = str(euv_response_identity.version)
+        euv_response_sha256 = str(euv_response_identity.sha256)
+        euv_response_identity_summary = dict(euv_response_identity.summary)
     euv_response_origin = "pyEUVTools" if render_selection.euv_response_sav is None else "response_sav"
     euv_response_override_path = None if render_selection.euv_response_sav is None else str(render_selection.euv_response_sav)
     euv_response_resolver = "pychmp.gxrender_adapter.resolve_euv_response_identity"
@@ -4819,6 +6331,15 @@ def main() -> int:
         "euv_response_identity_summary": (
             None if euv_response_identity_summary is None else dict(euv_response_identity_summary)
         ),
+        "render_projection": (
+            {
+                "parallel": bool(args.euv_parallel),
+                "exact": bool(args.euv_exact),
+                "nthreads": int(args.euv_projection_threads),
+            }
+            if render_selection.domain != "mw"
+            else None
+        ),
         "map_xc_arcsec": float(geometry.xc),
         "map_yc_arcsec": float(geometry.yc),
         "map_dx_arcsec": float(geometry.dx),
@@ -4850,9 +6371,20 @@ def main() -> int:
         "metrics_mask_source": "explicit_fits" if explicit_metric_mask is not None else "union_threshold",
         "mask_type": "explicit_fits" if explicit_metric_mask is not None else "union",
         "threshold_metric": float(args.threshold_metric),
-        "tr_mask_bmin_gauss": abs(float(args.tr_mask_bmin_gauss)) if render_selection.domain != "mw" else None,
+        "tr_mask_fits": (
+            None
+            if args.tr_mask_fits is None or render_selection.domain == "mw"
+            else str(Path(args.tr_mask_fits).expanduser())
+        ),
+        "tr_mask_bmin_gauss": (
+            None
+            if render_selection.domain == "mw" or args.tr_mask_fits is not None
+            else abs(float(args.tr_mask_bmin_gauss))
+        ),
         "tr_mask_source": (
-            "abs_blos_ge_bmin" if euv_tr_mask is not None else ("unavailable" if render_selection.domain != "mw" else None)
+            "explicit_fits"
+            if args.tr_mask_fits is not None and render_selection.domain != "mw"
+            else ("abs_blos_ge_bmin" if euv_tr_mask is not None else ("unavailable" if render_selection.domain != "mw" else None))
         ),
         "no_area": bool(args.no_area),
         "execution_policy": str(args.execution_policy),
@@ -4895,6 +6427,10 @@ def main() -> int:
             )
         target_search_id = pinned_search_id
         matching_search_id = pinned_search_id
+        validate_pinned_search_evaluation_recipe(
+            load_search_run_profile(artifact_h5, search_id=pinned_search_id),
+            compatibility_signature=compatibility_signature,
+        )
     elif bool(args.recompute_existing) and matching_search_id:
         target_search_id = matching_search_id
     elif matching_search_id and not bool(args.recompute_existing) and not new_search_identity:
@@ -4933,6 +6469,17 @@ def main() -> int:
                 "Slice preflight: skipped (new search identity on existing slice; "
                 "prior searches and map_store are preserved)"
             )
+    if matching_search_id and not _grid_reset_requested(args) and not new_search_identity:
+        args.preserve_stored_search_trials = True
+        if (not pinned_search_id and not bool(getattr(args, "retry_failed", False))
+                and _matching_search_is_finished(
+                    artifact_h5, slice_key=target_slice_key,
+                    search_id=target_search_id, diagnostics=root_diag,
+                )):
+            print(f"Already completed: {target_slice_key} | {target_search_id}; "
+                  "saved results reused; no rescoring or rendering", flush=True)
+            _maybe_launch_viewer("search already completed")
+            return 0
     root_diag["selected_search_id"] = target_search_id
     root_diag["search_id"] = target_search_id
     root_diag["search_active"] = True
@@ -5127,6 +6674,9 @@ def main() -> int:
         viewer_heartbeat.set_phase("initialized")
         viewer_heartbeat.notify_refresh()
 
+    if prebuilt_euv_response is not None:
+        save_response(artifact_h5, response_store_request, prebuilt_euv_response)
+
     factory = _AdaptiveRendererFactory(
         model_path=str(model_h5),
         ebtel_path=str(ebtel_path),
@@ -5156,7 +6706,7 @@ def main() -> int:
             lonc_deg=None if getattr(observer_overrides, "lonc_deg", None) is None else float(observer_overrides.lonc_deg),
             b0sun_deg=None if getattr(observer_overrides, "b0sun_deg", None) is None else float(observer_overrides.b0sun_deg),
         ),
-        observer_name=effective_observer_name,
+        observer_name=render_observer_name,
         pixel_scale_arcsec=float(args.pixel_scale_arcsec),
         psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         tr_region_mask=None if euv_tr_mask is None else np.asarray(euv_tr_mask, dtype=bool),
@@ -5166,14 +6716,21 @@ def main() -> int:
         ebtel_sha256=str(ebtel_sha256),
         euv_response_sha256=euv_response_sha256,
         euv_response_identity_version=euv_response_identity_version,
+        euv_parallel=bool(args.euv_parallel),
+        euv_exact=bool(args.euv_exact),
+        euv_projection_threads=int(args.euv_projection_threads),
+        prebuilt_euv_response=prebuilt_euv_response,
     )
     slice_map_index = None
     if artifact_h5.exists():
         from pychmp.slice_map_index import build_slice_map_index
 
         try:
+            index_started = time.perf_counter()
+            viewer_heartbeat.set_phase(f"indexing saved map metadata: {target_slice_key}")
             slice_map_index = build_slice_map_index(artifact_h5, slice_key=str(target_slice_key))
-            print(f"Slice map index ({target_slice_key}): {slice_map_index.summary()}")
+            print(f"Slice map index ({target_slice_key}): {slice_map_index.summary()} "
+                  f"in {time.perf_counter() - index_started:.1f}s", flush=True)
         except Exception as exc:
             print(f"Slice map index: unavailable ({exc})")
     cache = _PersistentPointCache(
@@ -5222,7 +6779,7 @@ def main() -> int:
             threshold=float(args.metrics_mask_threshold),
             explicit_mask=explicit_metric_mask,
             artifact_preexisting=artifact_preexisting,
-            hydrate_completed_points=not grid_reset,
+            hydrate_completed_points=bool(matching_search_id) and not grid_reset,
             )
         )
         reused_points = hydrated + promoted_same_slice + promoted_auxiliary + promoted_index
@@ -5342,11 +6899,26 @@ def main() -> int:
         live_shift_x_trials: list[float] = []
         live_shift_y_trials: list[float] = []
         live_shift_valid_trials: list[bool] = []
+        live_mask_stage_trials: list[str] = []
         active_point: dict[str, tuple[float, float] | None] = {"value": None}
         console_start_callback = progress_start_callback
         console_progress_callback = progress_callback
         def _serial_point_start(a_value: float, b_value: float) -> None:
             active_point["value"] = (float(a_value), float(b_value))
+            live_q0_trials.clear()
+            live_metric_trials.clear()
+            live_chi2_trials.clear()
+            live_rho2_trials.clear()
+            live_eta2_trials.clear()
+            live_shift_x_trials.clear()
+            live_shift_y_trials.clear()
+            live_shift_valid_trials.clear()
+            live_mask_stage_trials.clear()
+            warm_maps = cache.map_store_trial_count_for_point(float(a_value), float(b_value))
+            point_label = f"{point_search_spectral_label(factory)}; a={float(a_value):.3f} b={float(b_value):.3f}"
+            print(f"    Preparing point: {point_label}; {warm_maps} saved Q0 trial(s) indexed", flush=True)
+            viewer_heartbeat.set_phase(f"preparing point: {point_label}")
+            warm_started = time.perf_counter()
             committed = cache.commit_map_store_warm_trials_for_point(float(a_value), float(b_value))
             if committed > 0:
                 rescore_note = (
@@ -5355,12 +6927,19 @@ def main() -> int:
                     else "all metrics rescored; maps linked by ref"
                 )
                 print(
-                    f"    Warm start: {committed} grid trial(s) from map_store ({rescore_note})",
+                    f"    Warm start: {point_label}; {committed} grid trial(s) from map_store "
+                    f"({rescore_note}; {time.perf_counter() - warm_started:.2f}s)",
+                    flush=True,
+                )
+            elif warm_maps > 0 and cache.defer_warm_curve_commits():
+                print(
+                    f"    Warm start: {warm_maps} map_store trial(s) available "
+                    f"(curve builds as trials are evaluated)",
                     flush=True,
                 )
             else:
                 print(
-                    f"    Starting point: a={float(a_value):.3f} b={float(b_value):.3f} (rendering new trials)",
+                    f"    Starting point: {point_search_spectral_label(factory)}; a={float(a_value):.3f} b={float(b_value):.3f} (rendering new trials)",
                     flush=True,
                 )
 
@@ -5423,10 +7002,12 @@ def main() -> int:
                     live_shift_x_trials.append(float(getattr(evaluation, "shift_x_arcsec", np.nan)))
                     live_shift_y_trials.append(float(getattr(evaluation, "shift_y_arcsec", np.nan)))
                     live_shift_valid_trials.append(bool(getattr(evaluation, "find_shift_valid", True)))
+                    live_mask_stage_trials.append(str(getattr(evaluation, "mask_stage", "") or "").strip())
                 else:
                     live_shift_x_trials.append(float("nan"))
                     live_shift_y_trials.append(float("nan"))
                     live_shift_valid_trials.append(True)
+                    live_mask_stage_trials.append("")
                 point_key = (float(point[0]), float(point[1]))
                 completed_live_index = int(len(live_q0_trials) - 1)
                 completed_raw_map = cache.trial_raw_map_for(float(point[0]), float(point[1]), float(q0))
@@ -5441,6 +7022,7 @@ def main() -> int:
                     shift_x_trials=list(live_shift_x_trials),
                     shift_y_trials=list(live_shift_y_trials),
                     shift_valid_trials=list(live_shift_valid_trials),
+                    mask_stage_trials=list(live_mask_stage_trials),
                     completed_trial_index=completed_live_index,
                     completed_trial_raw_map=completed_raw_map,
                 )
@@ -5463,6 +7045,52 @@ def main() -> int:
         point_start_callback = None
         point_complete_callback = None
     try:
+        incomplete_count = len(getattr(cache, "incomplete_resume_candidates", lambda: [])())
+        if incomplete_count > 0:
+            print(
+                f"Resume drain: completing {incomplete_count} incomplete grid point(s) "
+                "before adaptive walk continues...",
+                flush=True,
+            )
+            drained = drain_incomplete_resume_points(
+                search_renderer_factory,
+                observed_cropped,
+                sigma_cropped,
+                cache_map=cache,
+                a_range=(float(args.a_min), float(args.a_max)),
+                b_range=(float(args.b_min), float(args.b_max)),
+                q0_min=float(args.q0_min),
+                q0_max=float(args.q0_max),
+                hard_q0_min=args.hard_q0_min,
+                hard_q0_max=args.hard_q0_max,
+                threshold=float(args.metrics_mask_threshold),
+                mask_type="union" if explicit_metric_mask is None else "explicit_fits",
+                explicit_mask=explicit_metric_mask,
+                target_metric=str(args.target_metric),
+                xatol=float(args.xatol),
+                maxiter=int(args.maxiter),
+                adaptive_bracketing=bool(args.adaptive_bracketing),
+                q0_step=float(args.q0_step),
+                max_bracket_steps=int(args.max_bracket_steps),
+                progress_start_callback=progress_start_callback,
+                progress_callback=progress_callback,
+                point_start_callback=point_start_callback,
+                point_complete_callback=point_complete_callback,
+                observation_reference=slice_obs_ref,
+                q0_search_stages=chmp_settings.q0_search_stages,
+                use_smoothed_obs_max=chmp_settings.use_smoothed_obs_max,
+                use_emthreshold=chmp_settings.use_emthreshold,
+                emthreshold=chmp_settings.emthreshold,
+                execution_policy=str(args.execution_policy),
+                max_workers=args.max_workers,
+                worker_chunksize=int(args.worker_chunksize),
+            )
+            remaining = len(getattr(cache, "incomplete_resume_candidates", lambda: [])())
+            print(
+                f"Resume drain: finished {int(drained)} point(s); "
+                f"{remaining} incomplete point(s) remain before adaptive walk",
+                flush=True,
+            )
         result = search_local_minimum_ab(
             search_renderer_factory,
             observed_cropped,
@@ -5568,8 +7196,18 @@ def main() -> int:
     print(f"  Total elapsed: {elapsed:.3f}s")
     if not bool(result.minimum_certified):
         print(
-            "WARNING: this run did not certify a closed local-minimum basin around the best point. "
-            "Resume with wider a/b bounds if you want the search to continue expanding around the currently evaluated basin."
+            format_uncertified_basin_expand_guidance(
+                artifact_h5=artifact_h5,
+                search_id=str(target_search_id),
+                a_min=float(args.a_min),
+                a_max=float(args.a_max),
+                b_min=float(args.b_min),
+                b_max=float(args.b_max),
+                da=float(args.da),
+                db=float(args.db),
+                boundary_axes=boundary_axes,
+                frontier_open_axes=tuple(str(axis) for axis in result.frontier_open_axes),
+            )
         )
         if bool(args.require_interior_best):
             return 2
