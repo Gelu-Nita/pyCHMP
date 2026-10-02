@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-02
+
+Observational EUV/UV unit correction, map-store indexing, warm-restart hardening, and
+viewer operator tools on top of the 0.1.0 unified-artifact stack.
+
 ### Added
 
 - EUV/UV observation loading: external FITS and embedded pyAMPP refmaps are converted
@@ -101,4 +106,5 @@ and [pyGXrender](https://pypi.org/project/pyGXrender/).
 - Full observational runs still require external model H5, EBTEL, and observation inputs
   (for example the `pyGXrender-test-data` checkout referenced in `README.md`).
 
+[0.2.0]: https://github.com/suncast-org/pyCHMP/releases/tag/v0.2.0
 [0.1.0]: https://github.com/suncast-org/pyCHMP/releases/tag/v0.1.0

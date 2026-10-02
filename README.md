@@ -38,7 +38,7 @@ pip install -e ".[dev]"
 ### SUNCAST fitting stack (pyAMPP → pyGXrender → pyCHMP)
 
 Observational fitting uses three installable packages. Pin versions in publications
-(for example `pyampp==1.0.2`, your chosen `pyGXrender` release, and `pychmp==0.1.0`).
+(for example `pyampp==1.0.2`, your chosen `pyGXrender` release, and `pychmp==0.2.0`).
 
 ```bash
 pip install -U pip setuptools wheel
@@ -255,7 +255,7 @@ python -m bumpver show
 
 ## Citation
 
-Please cite using [CITATION.cff](CITATION.cff) (version **0.1.0**) and the Zenodo
+Please cite using [CITATION.cff](CITATION.cff) (version **0.2.0**) and the Zenodo
 record DOI [10.5281/zenodo.20549272](https://doi.org/10.5281/zenodo.20549272).
 The all-versions concept DOI is
 [10.5281/zenodo.20549271](https://doi.org/10.5281/zenodo.20549271). See also
