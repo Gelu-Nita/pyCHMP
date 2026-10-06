@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-06
+
+Microwave SRH / NORH / SSRT PSF header paths with IDL-parity beam ports and compare
+examples, on top of the 0.2.0 observational EUV/map-store stack.
+
 ### Added
 
 - Microwave SRH beam header support in `pychmp.psf`: Viktor/srhimages σ axes
@@ -152,5 +157,6 @@ and [pyGXrender](https://pypi.org/project/pyGXrender/).
 - Full observational runs still require external model H5, EBTEL, and observation inputs
   (for example the `pyGXrender-test-data` checkout referenced in `README.md`).
 
+[0.3.0]: https://github.com/suncast-org/pyCHMP/releases/tag/v0.3.0
 [0.2.0]: https://github.com/suncast-org/pyCHMP/releases/tag/v0.2.0
 [0.1.0]: https://github.com/suncast-org/pyCHMP/releases/tag/v0.1.0
