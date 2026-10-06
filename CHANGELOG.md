@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Microwave SRH beam header support in `pychmp.psf`: Viktor/srhimages σ axes
+  (`BEAM_SA` / `BEAM_SB` / `BEAM_PHI`, `BEAM_P==1` only) and gx_simulator
+  `MakeSRHbeam` correlated σ (`BEAM_SX` / `BEAM_SY` / `BEAM_RHO`). σ values are
+  converted to FWHM for the existing elliptical-kernel path; frequency scaling
+  remains enabled for both radio forms.
+- NORH clean-beam PSF path (`pychmp.norh_beam`): in-tree port of SSW
+  `norh_prog2pinf` / `norh_beam` and gx `BeamFitNoRH`/`FitBeam`. Nobeyama FITS
+  headers with `PMAT*` + `OBS-FREQ` resolve to a frequency-scalable Gaussian
+  ellipse without an IDL runtime. Validated against Viktor’s IFZ sample
+  (`ifz140202_022005_corrected`) vs IDL reference beam samples and fit params.
+- Example `examples/python/compare_norh_ifz_beam_python_vs_idl.py`: side-by-side
+  Python vs `sswidl` ``norh_beam`` plot + numeric metrics for any NORH IFZ/FITS
+  (`--ifz` / `PYCHMP_NORH_IFZ`); P-angle from live IDL `get_rb0p` or header `SOLP`.
+- SSRT restoring-beam path (`pychmp.ssrt_beam`): in-tree port of gx
+  `GetSSRTangles` / `MakeSSRTbeam` / `BeamFitSSRT`. Example
+  `examples/python/compare_ssrt_beam_python_vs_idl.py` compares Python vs IDL
+  for any observation time, classic SSRT map ``.sav``, or map FITS via
+  ``--fits`` (time from ``DATE-OBS`` / ``TIME-OBS``).
+- SSRT FITS header routing in `pychmp.psf`: headers identified as SSRT
+  (`TELESCOP`/`INSTRUME`/`ORIGIN` containing SSRT or Badary AOR) resolve the
+  restoring beam from observation time via `BeamFitSSRT`, before the generic
+  `BMAJ`/`BMIN` path used by EOVSA. Image data are not required. Time cards
+  accept ISO/IDL forms and classic Badary ``DATE-OBS=DD/MM/YY`` plus
+  ``TIME-OBS``. The SSRT beam is monochromatic (~5.7 GHz) and does not
+  enable inverse-frequency scaling. `sunpy` is imported only inside
+  `GetSSRTangles`, so EOVSA/`BMAJ` resolve does not load it.
+
+### Changed
+
+- SRH header resolve soft-fails on unsupported `BEAM_P≠1`, non-positive
+  `BEAM_SA`/`BEAM_SB`, or invalid `BEAM_SX`/`BEAM_SY`/`BEAM_RHO`, falling
+  through to later routes (correlated σ, NORH, SSRT, or `BMAJ`) instead of
+  aborting the resolver.
+- NORH/SSRT IDL parity tests that need local fixtures are marked
+  `external_fixture` and skip cleanly when `PYCHMP_NORH_IFZ` /
+  `PYCHMP_SSRT_IDL_BEAM` (or sibling `SRH-NORH-4CHMP/`) are absent.
+
+### Known limitations
+
+- Super-Gaussian SRH `BEAM_P≠1` is not converted to a kernel; the resolver
+  falls through to SX/SY or `BMAJ` when present.
+- NORH beam uses header `SOLP` (degrees) rather than recomputing `get_rb0p`;
+  on standard products this matches IDL to ≲0.01°.
+
 ## [0.2.0] - 2026-10-02
 
 Observational EUV/UV unit correction, map-store indexing, warm-restart hardening, and
